@@ -91,7 +91,7 @@ prepare_stage2_data() {
       "${HF_ENDPOINT}/datasets/liuhaotian/LLaVA-Instruct-150K/resolve/main/llava_instruct_150k.json" \
       "${STAGE2_ROOT}/llava_instruct_150k.json"
     echo "[stage2-data] ERROR: ${STAGE2_ROOT}/${STAGE2_JSON} is project-generated and cannot be replaced by llava_instruct_150k.json."
-    echo "[stage2-data] Copy stage2_mixed_data.json from the trusted AeroMamba dataset backup, then rerun."
+    echo "[stage2-data] Copy stage2_mixed_data.json plus its COCO and Open3D-VQA images from the trusted AeroMamba dataset backup, then rerun."
     exit 1
   fi
 
@@ -133,7 +133,7 @@ ins_existing = sum((stage2_root / name).exists() for name in ins_images)
 print(f"LLaVA-Pretrain samples: {len(pre_data):,}; first-1000 images found: {pre_existing}/1000")
 print(f"Stage2 samples: {len(ins_data):,}; unique images found: {ins_existing:,}/{len(ins_images):,}")
 assert pre_existing > 0, "no LLaVA-Pretrain images found"
-assert ins_existing == len(ins_images), "some COCO train2017 images are missing"
+assert ins_existing == len(ins_images), "some Stage2 images are missing (COCO and/or Open3D-VQA)"
 PY
 }
 

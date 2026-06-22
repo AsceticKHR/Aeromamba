@@ -150,10 +150,23 @@ PY
 │   └── ...                         # 共 558,128 张图像
 ├── stage2_mixed_data.json          # AeroMamba 生成的混合标注
 ├── llava_instruct_150k.json        # 可保留，不能替代上一文件
-└── coco/
-    └── train2017/
-        ├── 000000000009.jpg
-        └── ...                     # COCO train2017 共 118,287 张
+├── coco/
+│   └── train2017/
+│       ├── 000000000009.jpg
+│       └── ...                     # COCO train2017 共 118,287 张
+└── open3d_vqa/
+    └── O3DVQA/
+        ├── EmbodiedCity/
+        │   └── Wuhan/{rgb,merged_qa.json}
+        ├── RealworldUAV/
+        │   ├── Lab/{rgb,merged_qa.json}
+        │   ├── Park/{rgb,merged_qa.json}
+        │   └── Residence/{rgb,merged_qa.json}
+        ├── UrbanScene/
+        │   ├── Campus/{rgb,merged_qa.json}
+        │   └── Residence/{rgb,merged_qa.json}
+        └── WildUAV/
+            └── Wild/{rgb,merged_qa.json}
 ```
 
 本地可信基准：
@@ -193,7 +206,7 @@ unzip -q images.zip -d /root/Aeromamba/data/llava_pretrain
 
 `unzip` 报 `End-of-central-directory signature not found` 基本意味着压缩包未下载完整，使用 `wget -c` 或 `aria2c --continue=true` 续传，不要直接解压或重命名掩盖问题。
 
-## 8. Stage 2 数据：AeroMamba + COCO
+## 8. Stage 2 数据：AeroMamba mixed JSON + COCO + Open3D-VQA
 
 ### 关键区别
 
@@ -202,6 +215,7 @@ unzip -q images.zip -d /root/Aeromamba/data/llava_pretrain
 - `llava_instruct_150k.json` 可从官方 `liuhaotian/LLaVA-Instruct-150K` 下载。
 - `stage2_mixed_data.json` 必须从本地可信备份 `dataset\aeromamba` 复制到服务器。
 - 如果只有官方原始 JSON，需要重新执行当初生成 mixed JSON 的项目数据处理流程；当前流水线不会猜测或静默生成它。
+- mixed JSON 同时引用 COCO 和 Open3D-VQA 图像；只恢复 COCO 会在训练取到 Open3D-VQA 样本时失败。
 
 COCO train2017 官方下载：
 
@@ -215,6 +229,40 @@ unzip -q train2017.zip
 
 若平台已提供 `/autodl-pub/data/COCO2017/train2017.zip`，可以直接解压该公共只读副本，避免重复下载。
 
+### Open3D-VQA 官方数据
+
+Open3D-VQA 的官方发布方是 EmbodiedCity：
+
+- 数据集：<https://huggingface.co/datasets/EmbodiedCity/Open3DVQA/tree/main>
+- 代码：<https://github.com/EmbodiedCity/Open3D-VQA.code>
+
+官方数据仓库当前提供 `o3dvqa_upload.zip`。推荐使用 Hugging Face CLI 断点续传：
+
+```bash
+mkdir -p /root/Aeromamba/data/open3d_vqa
+huggingface-cli download EmbodiedCity/Open3DVQA o3dvqa_upload.zip \
+  --repo-type dataset \
+  --local-dir /root/Aeromamba/data/open3d_vqa
+
+cd /root/Aeromamba/data/open3d_vqa
+unzip -t o3dvqa_upload.zip
+unzip -q o3dvqa_upload.zip
+```
+
+解压后必须检查最终路径。当前训练备份使用
+`/root/Aeromamba/data/open3d_vqa/O3DVQA/...`；如果官方压缩包额外套了一层目录，移动目录时应以
+`stage2_mixed_data.json` 中的 `image` 相对路径为准，不能把各场景的 `rgb` 文件夹拍平。
+
+也可以直接从本地可信镜像恢复，且这是复现本次训练最稳妥的方式：
+
+```text
+C:\Users\user\OneDrive - The University of Hong Kong - Connect\dataset\aeromamba\open3d_vqa\O3DVQA
+    -> /root/Aeromamba/data/open3d_vqa/O3DVQA
+```
+
+`merged_qa.json` 是 Open3D-VQA 的上游标注；本项目 Stage 2 实际读取的是根目录下经过合并和 LLaVA 格式转换的
+`stage2_mixed_data.json`。不要把任意一个 `merged_qa.json` 直接传给 `training/stage2_vlm.py`。
+
 ## 9. 数据一致性验证
 
 ### 文件数量
@@ -222,12 +270,14 @@ unzip -q train2017.zip
 ```bash
 find /root/Aeromamba/data/llava_pretrain -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l
 find /root/Aeromamba/data/coco/train2017 -type f -name '*.jpg' | wc -l
+find /root/Aeromamba/data/open3d_vqa/O3DVQA -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l
 ```
 
 预期分别为：
 
 - Stage 1 图像：`558128`
 - COCO train2017：`118287`
+- Open3D-VQA：以下载版本和本地可信备份为准；最终必须通过下面的 mixed JSON 全量路径检查
 
 ### 标注与路径全量检查
 
@@ -248,17 +298,33 @@ with open(root / 'stage2_mixed_data.json', encoding='utf-8') as f:
 pre_missing = [x['image'] for x in pre if not (pre_root / x['image']).is_file()]
 stage2_images = sorted({x['image'] for x in stage2})
 stage2_missing = [x for x in stage2_images if not (root / x).is_file()]
+stage2_by_source = {
+    'coco': [x for x in stage2_images if x.startswith('coco/')],
+    'open3d_vqa': [x for x in stage2_images if x.startswith('open3d_vqa/')],
+}
+stage2_unknown = [
+    x for x in stage2_images
+    if not x.startswith(('coco/', 'open3d_vqa/'))
+]
 
 print('stage1 samples:', len(pre))
 print('stage1 missing:', len(pre_missing))
 print('stage2 samples:', len(stage2))
 print('stage2 unique images:', len(stage2_images))
+print('stage2 COCO images:', len(stage2_by_source['coco']))
+print('stage2 Open3D-VQA images:', len(stage2_by_source['open3d_vqa']))
+print('stage2 unknown-prefix images:', len(stage2_unknown))
 print('stage2 missing:', len(stage2_missing))
+if stage2_missing:
+    print('first missing paths:', *stage2_missing[:20], sep='\n  ')
 
 assert len(pre) == 558_128
 assert not pre_missing
 assert len(stage2) == 231_036
 assert len(stage2_images) == 82_309
+assert stage2_by_source['coco']
+assert stage2_by_source['open3d_vqa']
+assert not stage2_unknown
 assert not stage2_missing
 PY
 ```
@@ -377,11 +443,12 @@ PY
 3. **压缩包只下载了一部分**：先 `stat` 和 `unzip -t`，再解压。
 4. **Stage 1 多套一层目录**：`data_root` 必须直接包含 JSON，图像路径以该目录为基准。
 5. **用官方 instruct JSON 冒充 mixed JSON**：样本数和路径语义不同，流水线会明确终止。
-6. **只检查 COCO 总数，不检查 JSON 引用**：必须执行第 9 节的唯一图像路径全量检查。
-7. **首次下载视觉权重时误判卡死**：DINO 与 SigLIP 是两个独立大文件，查看 `.incomplete` 增长。
-8. **混用 Conda 环境**：安装时和训练时始终使用同一个 `python -m pip`。
-9. **一上来 batch 16**：先用 batch 1 的两步冒烟测试，再逐步放大。
-10. **关闭终端导致训练停止**：必须用 `nohup`/`tmux`，并记录 PID 和日志路径。
-11. **PyTorch 2.1 使用 `expandable_segments` 崩溃**：该版本可能触发 CUDA allocator internal assert，本项目只保留 `max_split_size_mb:128`。
+6. **只恢复 COCO，漏掉 Open3D-VQA**：Stage 2 mixed JSON 同时引用两者，训练会在首次命中缺失样本时中断。
+7. **只检查图像总数，不检查 JSON 引用**：必须执行第 9 节的唯一图像路径全量检查。
+8. **首次下载视觉权重时误判卡死**：DINO 与 SigLIP 是两个独立大文件，查看 `.incomplete` 增长。
+9. **混用 Conda 环境**：安装时和训练时始终使用同一个 `python -m pip`。
+10. **一上来 batch 16**：先用 batch 1 的两步冒烟测试，再逐步放大。
+11. **关闭终端导致训练停止**：必须用 `nohup`/`tmux`，并记录 PID 和日志路径。
+12. **PyTorch 2.1 使用 `expandable_segments` 崩溃**：该版本可能触发 CUDA allocator internal assert，本项目只保留 `max_split_size_mb:128`。
 
-完成以上检查后，换环境时真正需要保存的是：代码版本、三个关键 JSON 的哈希、项目生成的 `stage2_mixed_data.json`、训练参数、日志和检查点。COCO 与 LLaVA-Pretrain 图像可以从官方渠道重新下载。
+完成以上检查后，换环境时真正需要保存的是：代码版本、三个关键 JSON 的哈希、项目生成的 `stage2_mixed_data.json`、训练参数、日志和检查点。COCO、LLaVA-Pretrain 与 Open3D-VQA 图像可以从官方渠道重新下载，但必须恢复成 mixed JSON 所记录的相对目录结构。

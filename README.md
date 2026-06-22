@@ -38,7 +38,7 @@ Keep in Git:
 Do not commit:
 
 - `checkpoints/`
-- `data/`
+- dataset assets stored under `data/` (dataset loader source files remain tracked)
 - `*.pth`, `*.ckpt`, `*.pt`
 - `*.zip`, `*.tar.gz`, `*.part`
 - SSH keys and local credentials
@@ -68,7 +68,14 @@ The project expects a stable data root on the server:
 ├── llava_pretrain/
 ├── stage2_mixed_data.json
 ├── llava_instruct_150k.json
-└── coco/
+├── coco/
+│   └── train2017/
+└── open3d_vqa/
+    └── O3DVQA/
+        ├── EmbodiedCity/
+        ├── RealworldUAV/
+        ├── UrbanScene/
+        └── WildUAV/
 ```
 
 Recommended Windows-side mirror:
@@ -77,9 +84,28 @@ Recommended Windows-side mirror:
 C:\Users\user\OneDrive - The University of Hong Kong - Connect\dataset\
 ├── llava_pretrain\
 └── aeromamba\
+    ├── stage2_mixed_data.json
+    ├── coco\train2017\
+    └── open3d_vqa\O3DVQA\
 ```
 
-If the current environment changes, copy the exact folder layout rather than rewriting dataset references inside the code.
+Stage 2 is not a COCO-only dataset. Its mixed annotation file references both
+COCO and Open3D-VQA images. The three required Stage 2 components are:
+
+- project-generated `stage2_mixed_data.json`
+- COCO `train2017` images
+- Open3D-VQA images under `open3d_vqa/O3DVQA`
+
+Download COCO from the [official COCO image server](http://images.cocodataset.org/zips/train2017.zip).
+Open3D-VQA is published by EmbodiedCity through its
+[official Hugging Face dataset repository](https://huggingface.co/datasets/EmbodiedCity/Open3DVQA/tree/main)
+and [official code repository](https://github.com/EmbodiedCity/Open3D-VQA.code).
+The project-generated mixed JSON is not reproduced by either upstream download;
+restore it from the trusted AeroMamba backup.
+
+If the current environment changes, preserve the paths recorded in
+`stage2_mixed_data.json`. Do not flatten or rename the Open3D-VQA directories.
+Run the full path-integrity check in the detailed data guide before training.
 
 ## Training Stages
 
@@ -102,7 +128,8 @@ python scripts/train_mamba.py --stage 1
 
 ### Stage 2
 
-Stage 2 fine-tunes the VLM stack with AeroMamba mixed data and COCO image paths.
+Stage 2 fine-tunes the VLM stack with AeroMamba mixed annotations over COCO and
+Open3D-VQA images.
 
 Recommended launcher:
 
@@ -126,7 +153,7 @@ python scripts/train_mamba.py --stage 3
 2. Install dependencies from `requirements.txt`.
 3. Put the datasets in the exact folder structure documented above.
 4. Confirm the Stage 1 LLaVA-Pretrain JSON and image counts.
-5. Confirm the Stage 2 mixed JSON and COCO image paths.
+5. Confirm every Stage 2 mixed-JSON path resolves to either a COCO or Open3D-VQA image.
 6. Start Stage 1 training and wait for a valid checkpoint.
 7. Start Stage 2 training from the Stage 1 checkpoint.
 8. Run the inference smoke test before any long experiment.

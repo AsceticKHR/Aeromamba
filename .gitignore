@@ -1,0 +1,81 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+conda-env/
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Training outputs and checkpoints
+checkpoints/
+runs/
+outputs/
+logs/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Dataset assets and archives
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
+data/**/*.bmp
+data/**/*.webp
+data/**/*.json
+data/**/*.zip
+data/**/*.tar
+data/**/*.tar.gz
+data/**/*.tgz
+data/**/*.rar
+data/**/*.7z
+data/**/*.part
+data/*.jpg
+data/*.jpeg
+data/*.png
+data/*.bmp
+data/*.webp
+data/*.json
+data/*.zip
+data/*.tar
+data/*.tar.gz
+data/*.tgz
+data/*.rar
+data/*.7z
+data/*.part
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.part
+
+# Local credentials and keys
+id_rsa
+.codex_aicloud_id_rsa
+*.pem
+*.key
+*.p12
+
+# Generated reports and caches
+reports/*.json
+reports/*.csv
+*.log

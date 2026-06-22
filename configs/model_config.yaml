@@ -1,0 +1,32 @@
+# AeroMamba-VLA Model Configuration
+# Edit this file to change model architecture before training.
+
+model:
+  # ── Backbone ────────────────────────────────────────────────────────────
+  mamba_type:  "mamba-370m"         # Options: mamba-130m / 370m / 790m / 1.4b / 2.8b
+  vision_type: "dinosiglip_so_384"  # Options: dinosiglip_so_384 / siglip_l_384 / siglip_b_224 / clip_l_336
+
+  # ── MLP Projector ────────────────────────────────────────────────────────
+  # LLaVA-1.5 style: Linear(D_v, D_m*2) → GELU → Linear(D_m*2, D_m) → LN
+  # No token compression — all N_vis patches are passed to Mamba.
+
+  # ── Action Head ─────────────────────────────────────────────────────────
+  chunk_size:  5                    # K future waypoints per prediction
+  action_dim:  4                    # [Δx, Δy, Δz, Δyaw_rad]
+
+  # ── Proprioception ──────────────────────────────────────────────────────
+  proprio_dim:       4              # [Δx, Δy, Δz, Δyaw]
+  proprio_num_freqs: 8              # Sinusoidal embedding frequency bands
+
+  # ── LoRA (Stage 2) ──────────────────────────────────────────────────────
+  lora_r:       16
+  lora_alpha:   32
+  lora_dropout: 0.05
+  lora_targets:
+    - "in_proj"
+    - "out_proj"
+    - "x_proj"
+    - "dt_proj"
+
+  # ── Loss weights ────────────────────────────────────────────────────────
+  lambda_smooth: 0.1               # Smoothness regularisation weight

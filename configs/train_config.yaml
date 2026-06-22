@@ -1,0 +1,42 @@
+# AeroMamba-VLA Training Configuration
+
+data:
+  data_root:   ""                   # Set to UAV-Flow dataset root. Empty = dummy data.
+  chunk_size:  5                    # Must match model.chunk_size
+  max_text_len: 64
+  pos_scale:   100.0                # cm → normalised (divide positions by this)
+  val_frac:    0.1
+  aug_flip:    true                 # Horizontal flip augmentation (train only)
+
+stage1:                             # MLPProjector alignment (InfoNCE)
+  epochs:   3
+  batch:    256
+  lr:       1.0e-3
+  workers:  4
+  save_dir: "./checkpoints/stage1"
+
+stage2:                             # Projector + Mamba-LoRA joint tuning
+  epochs:     5
+  batch:      16
+  lr:         2.0e-4
+  lora_r:     16
+  lora_alpha: 32
+  lambda_smooth: 0.05
+  workers:  4
+  save_dir: "./checkpoints/stage2"
+
+stage3:                             # ActionHead + ProprioEncoder training
+  epochs:        20
+  batch:         8
+  lr:            5.0e-4
+  lambda_smooth: 0.1
+  workers:  4
+  save_dir: "./checkpoints/stage3"
+
+inference:
+  port:             5007
+  host:             "0.0.0.0"
+  ensemble_window:  5
+  ensemble_decay:   0.7
+  ensemble_mode:    false           # false = return full K-step chunk per call
+  pos_scale:        100.0

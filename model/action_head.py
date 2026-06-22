@@ -1,0 +1,200 @@
+"""
+UAV Action Head for AeroMamba-VLA.
+
+Direct chunk regression — no intermediate sequence decoder.
+
+Architecture (RoboMamba two_mlp dimension-cascade style):
+    global_token [B, D_m]
+        ↓  3-layer MLP  (D_m → D_m/2 → D_m/4 → K*4)
+    [B, K*4]
+        ↓  reshape
+    [B, K, 4]   action chunk: (Δx, Δy, Δz, Δyaw_rad)
+
+Why simpler than the original SSMDecoder approach:
+  - K=5 is tiny; Cross-Attention decoder is overkill for such a short sequence.
+  - Direct L1 regression over K*4 outputs is more stable than sin/cos split
+    (no normalisation constraints, no atan2 at inference time).
+  - Matches OpenVLA-OFT "parallel decode + L1 regression" that achieves 26×
+    faster inference than token-by-token autoregressive decoding.
+  - Zero-init on the final layer keeps initial actions near zero,
+    which is safe for physical deployment.
+
+References:
+  RoboMamba (lmzpai/roboMamba)  — two_mlp policy head
+  OpenVLA-OFT (Kim et al. 2025) — action chunking + L1 regression
+  ACT (Zhao et al. 2023)        — temporal ensemble for smooth execution
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import deque
+
+
+# ---------------------------------------------------------------------------
+# Action Head
+# ---------------------------------------------------------------------------
+
+class UAVActionHead(nn.Module):
+    """
+    Lightweight direct-regression action head for UAV navigation.
+
+    Predicts K future 4-DOF waypoints from Mamba's last hidden state in a
+    single forward pass (no autoregressive decoding).
+
+    Args:
+        mamba_hidden_size : D_m from the Mamba backbone (default 1024).
+        chunk_size        : K future waypoints per prediction (default 5).
+        action_dim        : Per-step action dimension (default 4:
+                            Δx, Δy, Δz, Δyaw_rad).
+    """
+
+    def __init__(
+        self,
+        mamba_hidden_size: int = 1024,
+        chunk_size:        int = 5,
+        action_dim:        int = 4,
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        out_dim = chunk_size * action_dim
+        d = mamba_hidden_size
+
+        # RoboMamba-style dimension cascade: D → D/2 → D/4 → K*4
+        self.mlp = nn.Sequential(
+            nn.Linear(d,        d // 2),
+            nn.SiLU(),
+            nn.Linear(d // 2,  d // 4),
+            nn.SiLU(),
+            nn.Linear(d // 4,  out_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        # Zero-init the output layer: initial actions near zero for safe deployment
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, global_token: torch.Tensor) -> dict:
+        """
+        Args:
+            global_token : [B, D_m]  — last hidden state from Mamba backbone
+
+        Returns:
+            dict with:
+                'action' : [B, K, 4]  predicted chunk (Δx, Δy, Δz, Δyaw_rad)
+        """
+        raw    = self.mlp(global_token)                          # [B, K*4]
+        action = raw.view(-1, self.chunk_size, self.action_dim)  # [B, K, 4]
+        return {"action": action}
+
+
+# Backward compatibility alias (for any code importing the old name)
+UAVActionChunkHead = UAVActionHead
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+
+def aero_action_loss(
+    pred:          dict,
+    gt_action:     torch.Tensor,    # [B, K, 4]  (Δx, Δy, Δz, Δyaw_rad)
+    lambda_smooth: float = 0.1,
+) -> tuple:
+    """
+    Unified action-chunk loss.
+
+    Components:
+      - Smooth-L1 over all K steps × 4 DOF  (main regression objective)
+      - Smoothness regularisation: penalises jerk (2nd-order finite difference)
+        along the chunk dimension, encouraging physically plausible trajectories.
+
+    Args:
+        pred          : Output dict from UAVActionHead.forward()
+        gt_action     : Ground-truth [B, K, 4]
+        lambda_smooth : Weight for the smoothness term (default 0.1)
+
+    Returns:
+        (total_loss, detail_dict)
+    """
+    pred_action = pred["action"]    # [B, K, 4]
+
+    # Main: Smooth-L1 over the full action chunk
+    loss_main = F.smooth_l1_loss(pred_action, gt_action, beta=0.1)
+
+    # Intuitive Metric: Exact L1 distance
+    l1_err = F.l1_loss(pred_action, gt_action)
+
+    # Smoothness: penalise jerk (2nd-order finite difference along K dimension)
+    if pred_action.size(1) >= 3:
+        d1 = pred_action[:, 1:] - pred_action[:, :-1]   # velocity  [B, K-1, 4]
+        d2 = d1[:, 1:] - d1[:, :-1]                     # accel     [B, K-2, 4]
+        loss_smooth = d2.pow(2).mean()
+    else:
+        loss_smooth = pred_action.new_zeros(()).squeeze()
+
+    total  = loss_main + lambda_smooth * loss_smooth
+    detail = {
+        "main":   loss_main.item(),
+        "smooth": loss_smooth.item(),
+        "l1_err": l1_err.item(),
+    }
+    return total, detail
+
+
+# ---------------------------------------------------------------------------
+# Temporal Ensemble (inference utility)
+# ---------------------------------------------------------------------------
+
+class TemporalEnsemble:
+    """
+    Aggregates action-chunk predictions over a sliding window using
+    exponentially decaying weights to produce smooth executed actions.
+
+    Reference: ACT (Zhao et al. 2023) — temporal ensemble strategy.
+
+    Usage:
+        ens = TemporalEnsemble(window=5, decay=0.7)
+        for each control step:
+            chunk = model(...)["action"][0]  # [K, 4]
+            action = ens.update(chunk)       # [4]  ← execute this
+    """
+
+    def __init__(self, window: int = 5, decay: float = 0.7):
+        self.window = window
+        self.decay  = decay
+        self.buffer: deque = deque(maxlen=window)
+
+    def update(self, new_chunk: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            new_chunk : [K, 4]  model prediction for current step
+        Returns:
+            action    : [4]     exponentially weighted average action
+        """
+        self.buffer.append(new_chunk)
+        weights = [self.decay ** (len(self.buffer) - 1 - i)
+                   for i in range(len(self.buffer))]
+        w_sum   = sum(weights)
+        act_dim = new_chunk.shape[-1]
+        action_sum = torch.zeros(act_dim, device=new_chunk.device,
+                                  dtype=new_chunk.dtype)
+        for j, (chunk, w) in enumerate(zip(self.buffer, weights)):
+            # Each buffered chunk[i] predicted steps from time i forwards;
+            # to get the estimate for *current* step, we index into the chunk.
+            idx = len(self.buffer) - 1 - j
+            if idx < chunk.shape[0]:
+                action_sum += w * chunk[idx]
+        return action_sum / w_sum
+
+    def reset(self):
+        self.buffer.clear()

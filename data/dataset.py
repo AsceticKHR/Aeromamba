@@ -240,6 +240,143 @@ class UAVFlowDataset(Dataset):
         return torch.tensor(np.stack(chunk), dtype=torch.float32)  # [K, 4]
 
 
+class UAVFlowHFDataset(Dataset):
+    """
+    HuggingFace loader for wangxiangyu0814/UAV-Flow.
+
+    The dataset rows contain:
+        id, frame_idx, image, log
+
+    `log` is a JSON string with `raw_logs`, a future trajectory. Each raw log
+    entry is interpreted as [x, y, z, roll, yaw, pitch, timestamp]. Stage-3
+    actions are built as relative future waypoints from the first raw-log pose:
+        [dx, dy, dz, dyaw_deg]
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        tokenizer: AutoTokenizer,
+        transform,
+        split: str = "train",
+        data_files: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        chunk_size: int = 5,
+        max_text_len: int = 64,
+        instruction: str = "Navigate the UAV along the planned trajectory.",
+        pos_scale: float = 100.0,
+        aug_flip: bool = False,
+    ):
+        super().__init__()
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "UAVFlowHFDataset requires the `datasets` package. "
+                "Install it with `pip install datasets pyarrow`."
+            ) from exc
+
+        self.dataset_name = dataset_name
+        self.split = split
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.chunk_size = chunk_size
+        self.max_text_len = max_text_len
+        self.instruction = instruction
+        self.pos_scale = pos_scale
+        self.aug_flip = aug_flip
+
+        load_kwargs = {"split": split, "cache_dir": cache_dir}
+        if data_files:
+            load_kwargs["data_files"] = data_files
+        self.ds = load_dataset(dataset_name, **load_kwargs)
+        if len(self.ds) == 0:
+            raise ValueError(f"HuggingFace dataset {dataset_name!r} split {split!r} is empty.")
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.ds[int(idx)]
+
+        img = row["image"].convert("RGB")
+        if self.aug_flip and random.random() < 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        pixel_values = self.transform(img)
+
+        input_ids = self._tokenize(self.instruction)
+        raw_logs = self._parse_raw_logs(row.get("log", ""))
+
+        anchor = raw_logs[0]
+        yaw0 = float(anchor[4]) if len(anchor) > 4 else 0.0
+        proprio = torch.tensor(
+            [
+                0.0,
+                0.0,
+                0.0,
+                math.radians(yaw0),
+            ],
+            dtype=torch.float32,
+        )
+
+        gt_action = self._extract_relative_actions(raw_logs)
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "proprio": proprio,
+            "gt_action": gt_action,
+        }
+
+    def _tokenize(self, text: str) -> torch.Tensor:
+        tokens = self.tokenizer(
+            text,
+            max_length=self.max_text_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        return tokens["input_ids"].squeeze(0)
+
+    def _parse_raw_logs(self, log_text: str) -> List[List[float]]:
+        try:
+            payload = json.loads(log_text)
+            raw_logs = payload.get("raw_logs", [])
+        except Exception:
+            raw_logs = []
+
+        rows = []
+        for row in raw_logs:
+            if isinstance(row, (list, tuple)) and len(row) >= 3:
+                rows.append([float(x) for x in row])
+
+        if not rows:
+            rows = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        while len(rows) < self.chunk_size:
+            rows.append(rows[-1])
+        return rows
+
+    @staticmethod
+    def _yaw_delta_deg(yaw: float, yaw0: float) -> float:
+        return (yaw - yaw0 + 180.0) % 360.0 - 180.0
+
+    def _extract_relative_actions(self, raw_logs: List[List[float]]) -> torch.Tensor:
+        anchor = raw_logs[0]
+        x0, y0, z0 = float(anchor[0]), float(anchor[1]), float(anchor[2])
+        yaw0 = float(anchor[4]) if len(anchor) > 4 else 0.0
+
+        actions = []
+        for row in raw_logs[: self.chunk_size]:
+            yaw = float(row[4]) if len(row) > 4 else yaw0
+            raw_action = [
+                float(row[0]) - x0,
+                float(row[1]) - y0,
+                float(row[2]) - z0,
+                self._yaw_delta_deg(yaw, yaw0),
+            ]
+            actions.append(normalize_action(raw_action, self.pos_scale))
+        return torch.tensor(np.stack(actions), dtype=torch.float32)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Dummy Dataset (for smoke-tests and CI without real data)
 # ──────────────────────────────────────────────────────────────────────────────

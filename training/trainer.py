@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from model.uav_mamba_vla import AeroMambaVLA
-from data.dataset import UAVFlowDataset, DummyUAVDataset, aero_collate_fn
+from data.dataset import UAVFlowDataset, UAVFlowHFDataset, DummyUAVDataset, aero_collate_fn
 
 
 class BaseTrainer(ABC):
@@ -100,7 +100,27 @@ class BaseTrainer(ABC):
         Returns (train_dataset, val_dataset).
         """
         args = self.args
-        if getattr(args, "dummy", False) or not getattr(args, "data_root", ""):
+        hf_dataset = getattr(args, "hf_dataset", "")
+        if hf_dataset:
+            print(f"[Trainer] Using HuggingFace UAV-Flow dataset: {hf_dataset}")
+            ds = UAVFlowHFDataset(
+                dataset_name=hf_dataset,
+                split=getattr(args, "hf_split", "train"),
+                data_files=getattr(args, "hf_data_files", None),
+                cache_dir=getattr(args, "hf_cache_dir", None),
+                tokenizer=model.tokenizer,
+                transform=model.vision_encoder.transform,
+                chunk_size=getattr(args, "chunk_size", 5),
+                max_text_len=getattr(args, "max_text_len", 64),
+                instruction=getattr(
+                    args,
+                    "instruction",
+                    "Navigate the UAV along the planned trajectory.",
+                ),
+                pos_scale=getattr(args, "pos_scale", 100.0),
+                aug_flip=getattr(args, "aug_flip", False),
+            )
+        elif getattr(args, "dummy", False) or not getattr(args, "data_root", ""):
             print("[Trainer] Using DummyUAVDataset (no real data)")
             vision_type = getattr(args, "vision_type", "dinosiglip_so_384")
             dual = vision_type.startswith("dino") and ("siglip" in vision_type)

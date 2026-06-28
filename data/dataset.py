@@ -335,7 +335,15 @@ class UAVFlowHFDataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
-        return tokens["input_ids"].squeeze(0)
+        input_ids = tokens["input_ids"]
+        if isinstance(input_ids, torch.Tensor):
+            return input_ids.squeeze(0)
+
+        input_ids = list(input_ids)[: self.max_text_len]
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
+        if len(input_ids) < self.max_text_len:
+            input_ids.extend([pad_id] * (self.max_text_len - len(input_ids)))
+        return torch.tensor(input_ids, dtype=torch.long)
 
     def _parse_raw_logs(self, log_text: str) -> List[List[float]]:
         try:

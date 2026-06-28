@@ -23,6 +23,12 @@ from model.uav_mamba_vla import AeroMambaVLA
 from training.trainer    import BaseTrainer
 
 
+def _to_device(value, device):
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    return value.to(device, non_blocking=True)
+
+
 class Stage3Trainer(BaseTrainer):
     """Stage 3: Action Head + ProprioEncoder fine-tuning."""
 
@@ -49,7 +55,7 @@ class Stage3Trainer(BaseTrainer):
             print("[Stage3] No stage2_ckpt provided — training policy layers from scratch")
 
     def compute_loss(self, model, batch, device):
-        pixels    = batch["pixel_values"].to(device, non_blocking=True)
+        pixels    = _to_device(batch["pixel_values"], device)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         proprio   = batch["proprio"].to(device, non_blocking=True)
         gt_action = batch["gt_action"].to(device, non_blocking=True)

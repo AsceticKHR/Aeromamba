@@ -93,6 +93,24 @@ def _mamba_model_cls(config):
 
 
 def _load_pretrained_mamba(hub_name: str):
+    if hub_name == "state-spaces/mamba2-370m":
+        from transformers import Mamba2Config, Mamba2ForCausalLM
+        config = Mamba2Config(
+            hidden_size=1024,
+            num_hidden_layers=48,
+            vocab_size=50288,
+            state_size=128,
+            expand=2,
+            num_heads=32,
+            n_groups=1,
+            head_dim=64,
+            tie_word_embeddings=True,
+        )
+        return Mamba2ForCausalLM.from_pretrained(
+            hub_name,
+            config=config,
+            trust_remote_code=True,
+        )
     config = AutoConfig.from_pretrained(hub_name, trust_remote_code=True)
     model_cls = _mamba_model_cls(config)
     return model_cls.from_pretrained(hub_name, config=config, trust_remote_code=True)

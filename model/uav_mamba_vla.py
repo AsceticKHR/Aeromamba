@@ -224,7 +224,6 @@ class AeroMambaVLA(nn.Module):
         else:
             try:
                 self.mamba = _load_pretrained_mamba(hub_name)
-                self.tokenizer = AutoTokenizer.from_pretrained(hub_name)
             except Exception as e:
                 if mamba_type in {"mamba2-370m", "mamba-2-370m"}:
                     raise RuntimeError(
@@ -232,8 +231,10 @@ class AeroMambaVLA(nn.Module):
                     ) from e
                 print(f"\n[AeroMambaVLA] Warning: Failed to load pretrained Mamba weights ({e}). Initializing with random weights.")
                 self.mamba = _init_random_mamba(mamba_type)
-                
-                # Use gpt2 tokenizer as a fallback, and if that fails, use MockTokenizer
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(hub_name)
+            except Exception as e:
+                print(f"\n[AeroMambaVLA] Warning: Failed to load tokenizer from {hub_name} ({e}). Falling back to GPT-2/Mock tokenizer.")
                 try:
                     self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
                 except Exception as e2:

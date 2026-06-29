@@ -41,7 +41,13 @@ from torchvision.transforms import Compose, Resize
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Single-encoder presets
-SINGLE_ENCODERS: dict[str, str] = {
+SINGLE_ENCODERS: dict[str, Union[str, tuple[str, ...]]] = {
+    "siglip2_so_384": (
+        "vit_so400m_patch16_siglip2_384",
+        "vit_so400m_patch16_siglip2_384.webli",
+        "vit_so400m_patch16_siglip2_384.google",
+        "vit_so400m_patch14_siglip2_384",
+    ),
     "siglip_l_384":   "vit_large_patch16_siglip_384",
     "siglip_so_384":  "vit_so400m_patch14_siglip_384",
     "siglip_b_224":   "vit_base_patch16_siglip_224",
@@ -51,6 +57,7 @@ SINGLE_ENCODERS: dict[str, str] = {
 }
 
 SINGLE_IMG_SIZES: dict[str, int] = {
+    "siglip2_so_384": 384,
     "siglip_l_384":   384,
     "siglip_so_384":  384,
     "siglip_b_224":   224,
@@ -95,6 +102,17 @@ def _unpack_tuple(fn):
     return wrapper
 
 
+def _resolve_timm_model_name(encoder_type: str) -> str:
+    names = SINGLE_ENCODERS[encoder_type]
+    if isinstance(names, str):
+        return names
+    available = set(timm.list_models())
+    for name in names:
+        if name in available:
+            return name
+    return names[0]
+
+
 def _build_transform(backbone, img_size: int) -> Compose:
     """Build a torchvision Compose transform for a timm backbone, fixing the
     over-large default resize that SigLIP and IN1K models apply."""
@@ -134,6 +152,7 @@ class VisionEncoder(nn.Module):
         )
         self.encoder_type = encoder_type
         self.img_size     = SINGLE_IMG_SIZES[encoder_type]
+        self.timm_model_name = _resolve_timm_model_name(encoder_type)
 
         extra = {}
         if encoder_type.startswith("clip"):
@@ -146,7 +165,7 @@ class VisionEncoder(nn.Module):
         if offline:
             print("\n[VisionEncoder] Running in OFFLINE mode. Initializing vision backbone with random weights.")
             self.backbone = timm.create_model(
-                SINGLE_ENCODERS[encoder_type],
+                self.timm_model_name,
                 pretrained=False,
                 num_classes=0,
                 img_size=self.img_size,
@@ -155,7 +174,7 @@ class VisionEncoder(nn.Module):
         else:
             try:
                 self.backbone = timm.create_model(
-                    SINGLE_ENCODERS[encoder_type],
+                    self.timm_model_name,
                     pretrained=True,
                     num_classes=0,
                     img_size=self.img_size,
@@ -164,7 +183,7 @@ class VisionEncoder(nn.Module):
             except Exception as e:
                 print(f"\n[VisionEncoder] Warning: Failed to load pretrained vision weights ({e}). Initializing with random weights.")
                 self.backbone = timm.create_model(
-                    SINGLE_ENCODERS[encoder_type],
+                    self.timm_model_name,
                     pretrained=False,
                     num_classes=0,
                     img_size=self.img_size,

@@ -275,6 +275,12 @@ class BaseTrainer(ABC):
             chunk_size=getattr(args, "chunk_size",   5),
             use_token_pooling=getattr(args, "use_token_pooling", False),
             pool_size=getattr(args, "pool_size", 8),
+            token_resampler=getattr(args, "token_resampler", "none"),
+            num_visual_queries=getattr(args, "num_visual_queries", 32),
+            resampler_layers=getattr(args, "resampler_layers", 2),
+            resampler_heads=getattr(args, "resampler_heads", 8),
+            action_head_type=getattr(args, "action_head_type", "mlp"),
+            action_bound=getattr(args, "action_bound", 1.0),
         )
 
         # ── Load prior-stage weights (optional) ───────────────────────────────

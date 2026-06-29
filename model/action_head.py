@@ -83,7 +83,11 @@ class UAVActionHead(nn.Module):
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(self, global_token: torch.Tensor) -> dict:
+    def forward(
+        self,
+        global_token: torch.Tensor,
+        proprio: torch.Tensor | None = None,
+    ) -> dict:
         """
         Args:
             global_token : [B, D_m]  — last hidden state from Mamba backbone
@@ -95,6 +99,91 @@ class UAVActionHead(nn.Module):
         raw    = self.mlp(global_token)                          # [B, K*4]
         action = raw.view(-1, self.chunk_size, self.action_dim)  # [B, K, 4]
         return {"action": action}
+
+
+class UAVDynamicsActionHead(nn.Module):
+    """
+    Dynamics-aware lightweight action chunk head for UAV-Flow.
+
+    Instead of predicting K waypoints independently, this head rolls a compact
+    recurrent dynamics state forward for K steps. The recurrent state is
+    conditioned on the Mamba global token and the current UAV proprioception,
+    which makes smooth velocity/yaw-rate evolution an architectural prior
+    rather than relying only on loss regularisation.
+    """
+
+    def __init__(
+        self,
+        mamba_hidden_size: int = 1024,
+        chunk_size: int = 5,
+        action_dim: int = 4,
+        proprio_dim: int = 4,
+        hidden_ratio: float = 0.5,
+        action_bound: float = 1.0,
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        self.proprio_dim = proprio_dim
+        self.action_bound = action_bound
+        d = mamba_hidden_size
+        h = max(128, int(d * hidden_ratio))
+
+        self.context = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, h),
+            nn.SiLU(),
+        )
+        self.proprio_proj = nn.Sequential(
+            nn.LayerNorm(proprio_dim),
+            nn.Linear(proprio_dim, h),
+            nn.SiLU(),
+        )
+        self.step_embed = nn.Parameter(torch.randn(chunk_size, h) * 0.02)
+        self.cell = nn.GRUCell(input_size=action_dim + h, hidden_size=h)
+        self.delta_head = nn.Sequential(
+            nn.LayerNorm(h),
+            nn.Linear(h, h),
+            nn.SiLU(),
+            nn.Linear(h, action_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        final = self.delta_head[-1]
+        nn.init.normal_(final.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(final.bias)
+
+    def forward(
+        self,
+        global_token: torch.Tensor,
+        proprio: torch.Tensor | None = None,
+    ) -> dict:
+        batch = global_token.size(0)
+        state = self.context(global_token)
+        if proprio is None:
+            proprio = global_token.new_zeros(batch, self.proprio_dim)
+        prop = self.proprio_proj(proprio.to(dtype=global_token.dtype))
+        hidden = state + prop
+
+        prev_action = global_token.new_zeros(batch, self.action_dim)
+        actions = []
+        for step in range(self.chunk_size):
+            step_context = prop + self.step_embed[step].unsqueeze(0)
+            cell_input = torch.cat([prev_action, step_context], dim=-1)
+            hidden = self.cell(cell_input, hidden)
+            delta = self.delta_head(hidden)
+            if self.action_bound > 0:
+                delta = self.action_bound * torch.tanh(delta / self.action_bound)
+            actions.append(delta)
+            prev_action = delta
+
+        return {"action": torch.stack(actions, dim=1)}
 
 
 # Backward compatibility alias (for any code importing the old name)

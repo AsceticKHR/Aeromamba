@@ -62,7 +62,8 @@ if hasattr(sys.stderr, "reconfigure"):
 from .vision          import build_vision_encoder, DinoSigLIPEncoder
 from .projector       import MLPProjector
 from .proprio_encoder import ProprioEncoder
-from .action_head     import UAVActionHead, aero_action_loss
+from .action_head     import UAVActionHead, UAVDynamicsActionHead, aero_action_loss
+from .resampler       import PerceiverResampler
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,12 +132,21 @@ class AeroMambaVLA(nn.Module):
         freeze_vision: bool = True,
         use_token_pooling: bool = False,
         pool_size:     int  = 8,
+        token_resampler: str = "none",
+        num_visual_queries: int = 32,
+        resampler_layers: int = 2,
+        resampler_heads: int = 8,
+        action_head_type: str = "mlp",
+        action_bound: float = 1.0,
     ):
         super().__init__()
         self.chunk_size   = chunk_size
         self.vision_type  = vision_type
         self.use_token_pooling = use_token_pooling
         self.pool_size = pool_size
+        self.token_resampler_type = token_resampler
+        self.num_visual_queries = num_visual_queries
+        self.action_head_type = action_head_type
         self.is_dual_vision = isinstance(
             build_vision_encoder.__wrapped__ if hasattr(build_vision_encoder, "__wrapped__")
             else None, type(None)
@@ -207,6 +217,21 @@ class AeroMambaVLA(nn.Module):
             mamba_hidden_size=D_m,
         )
 
+        if token_resampler == "none":
+            self.token_resampler = nn.Identity()
+        elif token_resampler == "perceiver":
+            self.token_resampler = PerceiverResampler(
+                hidden_size=D_m,
+                num_queries=num_visual_queries,
+                num_layers=resampler_layers,
+                num_heads=resampler_heads,
+            )
+        else:
+            raise ValueError(
+                f"Unknown token_resampler '{token_resampler}'. "
+                "Choose from: 'none', 'perceiver'."
+            )
+
         # ── 4. Proprioception Encoder ────────────────────────────────────────
         self.proprio_encoder = ProprioEncoder(
             proprio_dim=proprio_dim,
@@ -214,10 +239,23 @@ class AeroMambaVLA(nn.Module):
         )
 
         # ── 5. Action Head ───────────────────────────────────────────────────
-        self.action_head = UAVActionHead(
-            mamba_hidden_size=D_m,
-            chunk_size=chunk_size,
-        )
+        if action_head_type == "mlp":
+            self.action_head = UAVActionHead(
+                mamba_hidden_size=D_m,
+                chunk_size=chunk_size,
+            )
+        elif action_head_type == "dynamics":
+            self.action_head = UAVDynamicsActionHead(
+                mamba_hidden_size=D_m,
+                chunk_size=chunk_size,
+                proprio_dim=proprio_dim,
+                action_bound=action_bound,
+            )
+        else:
+            raise ValueError(
+                f"Unknown action_head_type '{action_head_type}'. "
+                "Choose from: 'mlp', 'dynamics'."
+            )
 
         # Store key dimensions
         self.D_m = D_m
@@ -343,6 +381,7 @@ class AeroMambaVLA(nn.Module):
         # ── 3. Vision tokens ─────────────────────────────────────────────────
         vis_patches = self._encode_vision(pixel_values)   # [B, N_vis, D_v]
         vis_tokens  = self.projector(vis_patches)          # [B, N_vis, D_m]
+        vis_tokens  = self.token_resampler(vis_tokens)     # [B, N_resampled, D_m]
 
         # ── 4. Concatenate: [text | proprio | vision] ────────────────────────
         # Causal order: language context → flight state → visual observation.
@@ -360,7 +399,7 @@ class AeroMambaVLA(nn.Module):
         global_token = hidden[:, -1, :]    # [B, D_m]
 
         # ── 7. Action chunking head ───────────────────────────────────────────
-        pred = self.action_head(global_token)   # {"action": [B, K, 4]}
+        pred = self.action_head(global_token, proprio=proprio)   # {"action": [B, K, 4]}
 
         # ── 8. Loss (training only) ───────────────────────────────────────────
         if return_loss and gt_action is not None:
@@ -447,11 +486,12 @@ class AeroMambaVLA(nn.Module):
         self.configure_stage1()                         # freeze everything first
         self.apply_lora(r=lora_r, lora_alpha=lora_alpha)  # LoRA params auto-trainable
 
-    def configure_stage3(self) -> None:
+    def configure_stage3(self, train_lora: bool = False) -> None:
         """
         Stage 3 — Action head training.
-        Trainable : UAVActionHead + ProprioEncoder.
-        Frozen    : VisionEncoder(s), Mamba backbone, MLPProjector.
+        Trainable : UAVActionHead + ProprioEncoder + optional token resampler
+                    + optional Mamba-LoRA adapters.
+        Frozen    : VisionEncoder(s), base Mamba backbone, MLPProjector.
         """
         for p in self.parameters():
             p.requires_grad = False
@@ -459,6 +499,13 @@ class AeroMambaVLA(nn.Module):
             p.requires_grad = True
         for p in self.proprio_encoder.parameters():
             p.requires_grad = True
+        if not isinstance(self.token_resampler, nn.Identity):
+            for p in self.token_resampler.parameters():
+                p.requires_grad = True
+        if train_lora:
+            for name, p in self.mamba.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad = True
 
     # ─────────────────────────────────────────────────────────────────────────
     # Diagnostics
@@ -474,6 +521,7 @@ class AeroMambaVLA(nn.Module):
         modules: dict[str, nn.Module] = {
             "vision_encoder":  self.vision_encoder,
             "projector":       self.projector,
+            "token_resampler": self.token_resampler,
             "proprio_encoder": self.proprio_encoder,
             "mamba":           self.mamba,
             "action_head":     self.action_head,

@@ -105,6 +105,8 @@ def get_args():
     p.add_argument("--log_every",      type=int,   default=5)
     p.add_argument("--max_steps",      type=int,   default=None, help="Optional max train batches per epoch.")
     p.add_argument("--max_val_steps",  type=int,   default=100, help="Optional max validation batches.")
+    p.add_argument("--no_amp",         action="store_true", help="Disable CUDA autocast/GradScaler for numerical stability.")
+    p.add_argument("--save_every_steps", type=int, default=None, help="Save latest.pth every N training steps.")
     return p.parse_args()
 
 

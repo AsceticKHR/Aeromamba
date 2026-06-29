@@ -143,6 +143,9 @@ class BaseTrainer(ABC):
         n_val    = max(1, int(len(ds) * val_frac))
         n_train  = len(ds) - n_val
         train_ds, val_ds = random_split(ds, [n_train, n_val])
+        if getattr(ds, "sequential_loading_preferred", False):
+            train_ds.indices.sort()
+            val_ds.indices.sort()
         print(f"[Trainer] Dataset: {n_train} train  |  {n_val} val")
         return train_ds, val_ds
 
@@ -170,8 +173,13 @@ class BaseTrainer(ABC):
                 break
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", enabled=(self.device.type == "cuda")):
+            amp_enabled = (self.device.type == "cuda") and not getattr(self.args, "no_amp", False)
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 loss, detail = self.compute_loss(model, batch, self.device)
+
+            if not torch.isfinite(loss):
+                print(f"  [Ep{epoch:02d} | {bidx+1:05d}/{len(loader)}] WARNING non-finite loss; skipping batch")
+                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -191,6 +199,17 @@ class BaseTrainer(ABC):
                 )
                 t0 = time.time()
 
+            save_every_steps = getattr(self.args, "save_every_steps", None)
+            if save_every_steps and (bidx + 1) % save_every_steps == 0:
+                save_dir = Path(getattr(self.args, "save_dir", "./checkpoints"))
+                self._save_checkpoint(
+                    str(save_dir / "latest.pth"),
+                    model,
+                    optimizer,
+                    epoch,
+                    float("inf"),
+                )
+
         steps_run = min(max_steps, len(loader)) if (max_steps and len(loader) > max_steps) else len(loader)
         return total_loss / max(steps_run, 1)
 
@@ -208,8 +227,12 @@ class BaseTrainer(ABC):
         for batch in loader:
             if max_val_steps and steps_run >= max_val_steps:
                 break
-            with torch.amp.autocast("cuda", enabled=(self.device.type == "cuda")):
+            amp_enabled = (self.device.type == "cuda") and not getattr(self.args, "no_amp", False)
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 loss, detail = self.compute_loss(model, batch, self.device)
+            if not torch.isfinite(loss):
+                print("  [Val] WARNING non-finite loss; skipping batch")
+                continue
             total_loss += loss.item()
             for k, v in detail.items():
                 metrics_sum[k] = metrics_sum.get(k, 0.0) + v
@@ -268,8 +291,10 @@ class BaseTrainer(ABC):
         batch   = getattr(args, "batch",   16)
         collate_fn = self.get_collate_fn()
         pin = (self.device.type == "cuda")
+        base_train_ds = getattr(train_ds, "dataset", train_ds)
+        shuffle_train = not getattr(base_train_ds, "sequential_loading_preferred", False)
         train_loader = DataLoader(
-            train_ds, batch_size=batch, shuffle=True,
+            train_ds, batch_size=batch, shuffle=shuffle_train,
             num_workers=workers, pin_memory=pin, drop_last=True,
             collate_fn=collate_fn, persistent_workers=(workers > 0),
         )
@@ -290,9 +315,13 @@ class BaseTrainer(ABC):
             optimizer, T_max=epochs, eta_min=lr * 0.1,
         )
         try:
-            scaler = torch.amp.GradScaler(enabled=(self.device.type == "cuda"))
+            scaler = torch.amp.GradScaler(
+                enabled=(self.device.type == "cuda") and not getattr(args, "no_amp", False)
+            )
         except AttributeError:
-            scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == "cuda"))
+            scaler = torch.cuda.amp.GradScaler(
+                enabled=(self.device.type == "cuda") and not getattr(args, "no_amp", False)
+            )
 
         save_dir    = Path(getattr(args, "save_dir", "./checkpoints"))
         save_dir.mkdir(parents=True, exist_ok=True)

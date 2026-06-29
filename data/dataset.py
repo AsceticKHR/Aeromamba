@@ -25,6 +25,9 @@ If trajectories are chunked (UAV-Flow style, single-instruction per traj):
 
 from __future__ import annotations
 
+import bisect
+import glob
+import io
 import json
 import math
 import os
@@ -268,14 +271,6 @@ class UAVFlowHFDataset(Dataset):
         aug_flip: bool = False,
     ):
         super().__init__()
-        try:
-            from datasets import load_dataset
-        except ImportError as exc:
-            raise ImportError(
-                "UAVFlowHFDataset requires the `datasets` package. "
-                "Install it with `pip install datasets pyarrow`."
-            ) from exc
-
         self.dataset_name = dataset_name
         self.split = split
         self.tokenizer = tokenizer
@@ -285,21 +280,42 @@ class UAVFlowHFDataset(Dataset):
         self.instruction = instruction
         self.pos_scale = pos_scale
         self.aug_flip = aug_flip
+        self.sequential_loading_preferred = False
+        self._parquet_files: List[Path] = []
+        self._logical_row_groups: List[Tuple[int, int, int]] = []
+        self._logical_cumsum: List[int] = []
+        self._row_group_cache_key: Optional[Tuple[int, int]] = None
+        self._row_group_cache: Optional[Dict[str, Any]] = None
 
-        load_kwargs = {"split": split, "cache_dir": cache_dir}
-        if data_files:
-            load_kwargs["data_files"] = data_files
-        self.ds = load_dataset(dataset_name, **load_kwargs)
-        if len(self.ds) == 0:
-            raise ValueError(f"HuggingFace dataset {dataset_name!r} split {split!r} is empty.")
+        if dataset_name == "parquet" and data_files:
+            self.ds = None
+            self.sequential_loading_preferred = True
+            self._init_local_parquet(data_files)
+        else:
+            try:
+                from datasets import load_dataset
+            except ImportError as exc:
+                raise ImportError(
+                    "UAVFlowHFDataset requires the `datasets` package. "
+                    "Install it with `pip install datasets pyarrow`."
+                ) from exc
+
+            load_kwargs = {"split": split, "cache_dir": cache_dir}
+            if data_files:
+                load_kwargs["data_files"] = data_files
+            self.ds = load_dataset(dataset_name, **load_kwargs)
+            if len(self.ds) == 0:
+                raise ValueError(f"HuggingFace dataset {dataset_name!r} split {split!r} is empty.")
 
     def __len__(self) -> int:
+        if self._logical_cumsum:
+            return self._logical_cumsum[-1]
         return len(self.ds)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        row = self.ds[int(idx)]
+        row = self._get_local_parquet_row(int(idx)) if self._logical_cumsum else self.ds[int(idx)]
 
-        img = row["image"].convert("RGB")
+        img = self._coerce_image(row["image"])
         if self.aug_flip and random.random() < 0.5:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         pixel_values = self.transform(img)
@@ -326,6 +342,92 @@ class UAVFlowHFDataset(Dataset):
             "proprio": proprio,
             "gt_action": gt_action,
         }
+
+    def _init_local_parquet(self, data_files: Any) -> None:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "Local parquet training requires `pyarrow`. "
+                "Install it with `pip install pyarrow`."
+            ) from exc
+
+        patterns: List[str] = []
+        if isinstance(data_files, (str, os.PathLike)):
+            patterns = [str(data_files)]
+        elif isinstance(data_files, dict):
+            for value in data_files.values():
+                if isinstance(value, (list, tuple)):
+                    patterns.extend(str(item) for item in value)
+                else:
+                    patterns.append(str(value))
+        else:
+            patterns = [str(item) for item in data_files]
+
+        files: List[Path] = []
+        for pattern in patterns:
+            matches = glob.glob(pattern)
+            files.extend(Path(match) for match in (matches or [pattern]))
+        self._parquet_files = sorted(path for path in files if path.exists())
+        if not self._parquet_files:
+            raise FileNotFoundError(f"No parquet files matched data_files={data_files!r}")
+
+        row_groups: List[Tuple[int, int, int]] = []
+        for file_index, parquet_path in enumerate(self._parquet_files):
+            parquet_file = pq.ParquetFile(str(parquet_path))
+            for row_group_index in range(parquet_file.num_row_groups):
+                row_count = parquet_file.metadata.row_group(row_group_index).num_rows
+                if row_count > 0:
+                    row_groups.append((file_index, row_group_index, row_count))
+
+        rng = random.Random(20260629)
+        rng.shuffle(row_groups)
+        total_rows = 0
+        self._logical_row_groups = row_groups
+        self._logical_cumsum = []
+        for _, _, row_count in row_groups:
+            total_rows += row_count
+            self._logical_cumsum.append(total_rows)
+        if total_rows == 0:
+            raise ValueError(f"No rows found in parquet files matched by {data_files!r}")
+
+    def _get_local_parquet_row(self, idx: int) -> Dict[str, Any]:
+        import pyarrow.parquet as pq
+
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        group_position = bisect.bisect_right(self._logical_cumsum, idx)
+        group_start = 0 if group_position == 0 else self._logical_cumsum[group_position - 1]
+        row_offset = idx - group_start
+        file_index, row_group_index, _ = self._logical_row_groups[group_position]
+        cache_key = (file_index, row_group_index)
+        if self._row_group_cache_key != cache_key:
+            parquet_path = self._parquet_files[file_index]
+            row_group = pq.ParquetFile(str(parquet_path), memory_map=True).read_row_group(
+                row_group_index,
+                columns=["image", "log"],
+            )
+            self._row_group_cache = row_group.to_pydict()
+            self._row_group_cache_key = cache_key
+
+        assert self._row_group_cache is not None
+        return {
+            "image": self._row_group_cache["image"][row_offset],
+            "log": self._row_group_cache["log"][row_offset],
+        }
+
+    @staticmethod
+    def _coerce_image(image_value: Any) -> Image.Image:
+        if isinstance(image_value, Image.Image):
+            return image_value.convert("RGB")
+        if isinstance(image_value, dict):
+            image_bytes = image_value.get("bytes")
+            if image_bytes:
+                return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            image_path = image_value.get("path")
+            if image_path:
+                return Image.open(image_path).convert("RGB")
+        raise ValueError("UAV-Flow row does not contain a valid image")
 
     def _tokenize(self, text: str) -> torch.Tensor:
         tokens = self.tokenizer(
@@ -355,7 +457,12 @@ class UAVFlowHFDataset(Dataset):
         rows = []
         for row in raw_logs:
             if isinstance(row, (list, tuple)) and len(row) >= 3:
-                rows.append([float(x) for x in row])
+                try:
+                    values = [float(x) for x in row]
+                except (TypeError, ValueError):
+                    continue
+                if all(math.isfinite(value) for value in values):
+                    rows.append(values)
 
         if not rows:
             rows = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]

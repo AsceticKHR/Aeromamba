@@ -94,6 +94,9 @@ def _mamba_model_cls(config):
 
 def _load_pretrained_mamba(hub_name: str):
     if hub_name == "state-spaces/mamba2-370m":
+        from pathlib import Path
+        import torch
+        from huggingface_hub import snapshot_download
         from transformers import Mamba2Config, Mamba2ForCausalLM
         config = Mamba2Config(
             hidden_size=1024,
@@ -106,12 +109,21 @@ def _load_pretrained_mamba(hub_name: str):
             head_dim=64,
             tie_word_embeddings=True,
         )
-        return Mamba2ForCausalLM.from_pretrained(
+        model = Mamba2ForCausalLM.from_pretrained(
             hub_name,
             config=config,
             trust_remote_code=True,
-            low_cpu_mem_usage=False,
         )
+        if getattr(model.backbone.embeddings.weight, "is_meta", False):
+            snapshot = Path(snapshot_download(hub_name, allow_patterns=["pytorch_model.bin"]))
+            state = torch.load(snapshot / "pytorch_model.bin", map_location="cpu")
+            weight = state["backbone.embedding.weight"]
+            embedding = nn.Embedding(weight.shape[0], weight.shape[1])
+            embedding.weight.data.copy_(weight)
+            model.backbone.embeddings = embedding
+            model.lm_head = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+            model.lm_head.weight = model.backbone.embeddings.weight
+        return model
     config = AutoConfig.from_pretrained(hub_name, trust_remote_code=True)
     model_cls = _mamba_model_cls(config)
     return model_cls.from_pretrained(

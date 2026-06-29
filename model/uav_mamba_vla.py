@@ -50,7 +50,7 @@ from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import MambaForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, MambaForCausalLM
 
 # Reconfigure stdout/stderr to UTF-8 on Windows (default is CP1252 in PowerShell)
 # This prevents UnicodeEncodeError when printing box-drawing / emoji characters.
@@ -76,11 +76,43 @@ MAMBA_PRESETS: dict[str, str] = {
     "mamba-790m":   "state-spaces/mamba-790m-hf",
     "mamba-1.4b":   "state-spaces/mamba-1.4b-hf",
     "mamba-2.8b":   "state-spaces/mamba-2.8b-hf",
+    "mamba2-370m":  "state-spaces/mamba2-370m",
+    "mamba-2-370m": "state-spaces/mamba2-370m",
     "mamba-zephyr": "xiuyul/mamba-2.8b-zephyr",
 }
 
 # Default LoRA target modules for Mamba's SSM projections
 MAMBA_LORA_TARGETS = ["in_proj", "x_proj", "dt_proj"]
+
+
+def _mamba_model_cls(config):
+    if getattr(config, "model_type", "") == "mamba2":
+        from transformers import Mamba2ForCausalLM
+        return Mamba2ForCausalLM
+    return MambaForCausalLM
+
+
+def _load_pretrained_mamba(hub_name: str):
+    config = AutoConfig.from_pretrained(hub_name, trust_remote_code=True)
+    model_cls = _mamba_model_cls(config)
+    return model_cls.from_pretrained(hub_name, config=config, trust_remote_code=True)
+
+
+def _init_random_mamba(mamba_type: str):
+    if mamba_type in {"mamba2-370m", "mamba-2-370m"}:
+        raise RuntimeError(
+            "Mamba-2-370M requires pretrained config/weights from "
+            "'state-spaces/mamba2-370m'. Disable AEROMAMBA_OFFLINE or cache the "
+            "model before training."
+        )
+    from transformers import MambaConfig
+    presets = {
+        "mamba-130m": {"num_hidden_layers": 24, "hidden_size": 768},
+        "mamba-370m": {"num_hidden_layers": 48, "hidden_size": 1024},
+        "mamba-790m": {"num_hidden_layers": 48, "hidden_size": 1536},
+    }
+    cfg_args = presets.get(mamba_type, presets["mamba-370m"])
+    return MambaForCausalLM(MambaConfig(**cfg_args))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,31 +201,19 @@ class AeroMambaVLA(nn.Module):
         
         if offline:
             print("\n[AeroMambaVLA] Running in OFFLINE mode. Initializing Mamba with random weights.")
-            from transformers import MambaConfig
-            presets = {
-                "mamba-130m": {"num_hidden_layers": 24, "hidden_size": 768},
-                "mamba-370m": {"num_hidden_layers": 48, "hidden_size": 1024},
-                "mamba-790m": {"num_hidden_layers": 48, "hidden_size": 1536},
-            }
-            cfg_args = presets.get(mamba_type, presets["mamba-370m"])
-            config = MambaConfig(**cfg_args)
-            self.mamba = MambaForCausalLM(config)
+            self.mamba = _init_random_mamba(mamba_type)
             self.tokenizer = MockTokenizer()
         else:
             try:
-                self.mamba     = MambaForCausalLM.from_pretrained(hub_name)
+                self.mamba = _load_pretrained_mamba(hub_name)
                 self.tokenizer = AutoTokenizer.from_pretrained(hub_name)
             except Exception as e:
+                if mamba_type in {"mamba2-370m", "mamba-2-370m"}:
+                    raise RuntimeError(
+                        f"Failed to load pretrained Mamba-2 weights from {hub_name}: {e}"
+                    ) from e
                 print(f"\n[AeroMambaVLA] Warning: Failed to load pretrained Mamba weights ({e}). Initializing with random weights.")
-                from transformers import MambaConfig
-                presets = {
-                    "mamba-130m": {"num_hidden_layers": 24, "hidden_size": 768},
-                    "mamba-370m": {"num_hidden_layers": 48, "hidden_size": 1024},
-                    "mamba-790m": {"num_hidden_layers": 48, "hidden_size": 1536},
-                }
-                cfg_args = presets.get(mamba_type, presets["mamba-370m"])
-                config = MambaConfig(**cfg_args)
-                self.mamba = MambaForCausalLM(config)
+                self.mamba = _init_random_mamba(mamba_type)
                 
                 # Use gpt2 tokenizer as a fallback, and if that fails, use MockTokenizer
                 try:

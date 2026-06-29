@@ -258,6 +258,12 @@ class AeroMambaVLA(nn.Module):
                 except Exception as e2:
                     print(f"[AeroMambaVLA] Warning: Failed to load gpt2 tokenizer ({e2}). Using MockTokenizer.")
                     self.tokenizer = MockTokenizer()
+            if getattr(self.tokenizer, "pad_token", None) is None:
+                self.tokenizer.pad_token = (
+                    getattr(self.tokenizer, "eos_token", None)
+                    or getattr(self.tokenizer, "unk_token", None)
+                    or "<|endoftext|>"
+                )
         D_m            = self.mamba.config.hidden_size
 
         # NOTE: We do NOT replace lm_head with nn.Identity here.

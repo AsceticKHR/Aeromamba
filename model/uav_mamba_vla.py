@@ -110,10 +110,16 @@ def _load_pretrained_mamba(hub_name: str):
             hub_name,
             config=config,
             trust_remote_code=True,
+            low_cpu_mem_usage=False,
         )
     config = AutoConfig.from_pretrained(hub_name, trust_remote_code=True)
     model_cls = _mamba_model_cls(config)
-    return model_cls.from_pretrained(hub_name, config=config, trust_remote_code=True)
+    return model_cls.from_pretrained(
+        hub_name,
+        config=config,
+        trust_remote_code=True,
+        low_cpu_mem_usage=False,
+    )
 
 
 def _init_random_mamba(mamba_type: str):

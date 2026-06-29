@@ -66,6 +66,10 @@ SINGLE_IMG_SIZES: dict[str, int] = {
     "dinov2_l_reg":   518,
 }
 
+HF_SINGLE_ENCODERS: dict[str, str] = {
+    "siglip2_so_384": "google/siglip2-so400m-patch14-384",
+}
+
 # DinoSigLIP dual-encoder presets  — (dino_timm, siglip_timm, shared_img_size)
 DINOSIGLIP_ENCODERS: dict[str, tuple] = {
     # Matches UAV-OpenVLA "dinosiglip-vit-so-384px" exactly
@@ -111,6 +115,14 @@ def _resolve_timm_model_name(encoder_type: str) -> str:
         if name in available:
             return name
     return names[0]
+
+
+def _has_timm_model(encoder_type: str) -> bool:
+    names = SINGLE_ENCODERS[encoder_type]
+    if isinstance(names, str):
+        return names in set(timm.list_models())
+    available = set(timm.list_models())
+    return any(name in available for name in names)
 
 
 def _build_transform(backbone, img_size: int) -> Compose:
@@ -231,6 +243,95 @@ class VisionEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class HFImageTransform:
+    processor: object
+
+    def __call__(self, img) -> torch.Tensor:
+        batch = self.processor(images=img, return_tensors="pt")
+        return batch["pixel_values"][0]
+
+
+class HFVisionEncoder(nn.Module):
+    """
+    Single vision encoder backed by HuggingFace Transformers.
+
+    This is primarily used for SigLIP2, which is not exposed by every timm
+    release yet. It returns penultimate-layer visual tokens [B, N, D], matching
+    the timm-backed VisionEncoder contract used by the rest of AeroMamba.
+    """
+
+    def __init__(self, encoder_type: str = "siglip2_so_384", freeze: bool = True):
+        super().__init__()
+        if encoder_type not in HF_SINGLE_ENCODERS:
+            raise ValueError(f"Unknown HF encoder_type '{encoder_type}'.")
+
+        import os
+        from transformers import AutoImageProcessor, AutoModel
+
+        self.encoder_type = encoder_type
+        self.model_id = HF_SINGLE_ENCODERS[encoder_type]
+        self.img_size = SINGLE_IMG_SIZES[encoder_type]
+        local_files_only = os.environ.get("AEROMAMBA_OFFLINE", "0") == "1"
+
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(
+                self.model_id,
+                local_files_only=local_files_only,
+                trust_remote_code=True,
+            )
+            self.backbone = AutoModel.from_pretrained(
+                self.model_id,
+                local_files_only=local_files_only,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load HF vision encoder '{self.model_id}'. "
+                "Install a Transformers version with SigLIP2 support and make "
+                "sure the model weights are cached or network access is enabled."
+            ) from exc
+
+        self.backbone.eval()
+        vision_config = getattr(self.backbone.config, "vision_config", self.backbone.config)
+        self.hidden_size = int(getattr(vision_config, "hidden_size"))
+        patch_size = int(getattr(vision_config, "patch_size", 14))
+        image_size = int(getattr(vision_config, "image_size", self.img_size))
+        self.num_patches = (image_size // patch_size) ** 2
+        self.transform = HFImageTransform(self.processor)
+
+        if freeze:
+            self.freeze()
+
+    def _vision_forward(self, pixel_values: torch.Tensor):
+        if hasattr(self.backbone, "vision_model"):
+            return self.backbone.vision_model(
+                pixel_values=pixel_values,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        return self.backbone(
+            pixel_values=pixel_values,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        out = self._vision_forward(pixel_values)
+        hidden_states = getattr(out, "hidden_states", None)
+        if hidden_states is not None and len(hidden_states) >= 2:
+            return hidden_states[-2]
+        return out.last_hidden_state
+
+    def freeze(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def unfreeze(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+
+
 # DinoSigLIP dual-encoder  (UAV-OpenVLA style)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -373,7 +474,7 @@ class DinoSigLIPEncoder(nn.Module):
 def build_vision_encoder(
     encoder_type: str = "siglip_l_384",
     freeze:       bool = True,
-) -> Union[VisionEncoder, DinoSigLIPEncoder]:
+) -> Union[VisionEncoder, HFVisionEncoder, DinoSigLIPEncoder]:
     """
     Build the appropriate vision encoder from a string key.
 
@@ -386,6 +487,16 @@ def build_vision_encoder(
         .transform         — torchvision Compose (single) or DinoSigLIPTransform (dual)
         .forward(...)      — [B, N, D]
     """
+    if encoder_type in HF_SINGLE_ENCODERS:
+        import os
+        if os.environ.get("AEROMAMBA_SIGLIP2_BACKEND", "hf").lower() == "timm":
+            if not _has_timm_model(encoder_type):
+                raise RuntimeError(
+                    f"Requested timm backend for '{encoder_type}', but no matching "
+                    "timm model is available in this environment."
+                )
+            return VisionEncoder(encoder_type=encoder_type, freeze=freeze)
+        return HFVisionEncoder(encoder_type=encoder_type, freeze=freeze)
     if encoder_type in DINOSIGLIP_ENCODERS:
         return DinoSigLIPEncoder(encoder_id=encoder_type, freeze=freeze)
     elif encoder_type in SINGLE_ENCODERS:

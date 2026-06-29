@@ -82,7 +82,7 @@ MAMBA_PRESETS: dict[str, str] = {
 }
 
 # Default LoRA target modules for Mamba's SSM projections
-MAMBA_LORA_TARGETS = ["in_proj", "x_proj", "dt_proj"]
+MAMBA_LORA_TARGETS = ["in_proj", "out_proj", "x_proj", "dt_proj"]
 
 
 def _mamba_model_cls(config):

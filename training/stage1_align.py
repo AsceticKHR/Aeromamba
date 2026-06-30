@@ -155,6 +155,10 @@ def get_args():
     p.add_argument("--workers",       type=int,   default=4)
     p.add_argument("--max_text_len",  type=int,   default=128)
     p.add_argument("--log_every",     type=int,   default=5)
+    p.add_argument("--max_steps",     type=int,   default=None)
+    p.add_argument("--max_val_steps", type=int,   default=100)
+    p.add_argument("--no_amp",        action="store_true")
+    p.add_argument("--save_every_steps", type=int, default=None)
     return p.parse_args()
 
 

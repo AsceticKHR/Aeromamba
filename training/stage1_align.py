@@ -140,6 +140,7 @@ def get_args():
     p = argparse.ArgumentParser(description="AeroMamba Stage 1: CLM Projector Alignment")
     p.add_argument("--dummy",         action="store_true",     help="Keep for compatibility, not active")
     p.add_argument("--data_root",     default="./data/llava_subset", help="Path to LLaVA subset folder")
+    p.add_argument("--json_name",     default="llava_subset.json")
     p.add_argument("--mamba_type",    default="mamba-370m")
     p.add_argument("--vision_type",   default="dinosiglip_so_384")
     p.add_argument("--token_resampler", default="none", choices=["none", "perceiver"])

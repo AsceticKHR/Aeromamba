@@ -40,10 +40,12 @@ class Stage2Trainer(BaseTrainer):
             print(f"[Stage2] Loading Stage-1 projector from: {ckpt_path}")
             state = torch.load(ckpt_path, map_location="cpu")
             state = state.get("model_state", state)   # unwrap if wrapped checkpoint
-            proj_state = {k: v for k, v in state.items()
-                          if k.startswith("projector.")}
-            model.load_state_dict(proj_state, strict=False)
-            print(f"         Loaded {len(proj_state)} projector parameter tensors")
+            align_state = {
+                k: v for k, v in state.items()
+                if k.startswith("projector.") or k.startswith("token_resampler.")
+            }
+            model.load_state_dict(align_state, strict=False)
+            print(f"         Loaded {len(align_state)} projector/resampler tensors")
         else:
             print("[Stage2] No stage1_ckpt provided — training projector from scratch")
 

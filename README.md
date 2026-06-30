@@ -1,175 +1,241 @@
 # AeroMamba
 
-AeroMamba is a staged Mamba-based vision-language-action pipeline for UAV training and evaluation. This repository keeps the **core code only**:
+AeroMamba is a lightweight staged vision-language-action (VLA) training stack for UAV navigation. The current training path uses a frozen SigLIP2 vision encoder, a Mamba2 language/state-space backbone, a learned visual token resampler, and a dynamics-aware UAV action head.
 
-- model definitions
-- training stages
-- inference helpers
-- reproducible environment and data guides
+This repository tracks source code, training scripts, and reproducibility notes only. Datasets, checkpoints, local credentials, logs, and cache files must stay outside Git.
 
-Large artifacts such as checkpoints, datasets, archives, and local keys are excluded from version control.
+## Current Recommended Architecture
+
+| Component | Current default | Purpose |
+| --- | --- | --- |
+| Vision encoder | `siglip2_base_384` (`google/siglip2-base-patch16-384`) | Frozen visual feature extractor with 384px input and 576 patch tokens |
+| Language backbone | `mamba-2-370m` (`state-spaces/mamba2-370m`) | Frozen base Mamba2 backbone with LoRA adapters in later stages |
+| Visual adapter | `MLPProjector` | Maps SigLIP2 visual features into Mamba hidden space |
+| Token compressor | `PerceiverResampler`, 32 queries | Reduces visual tokens before Mamba (`576 -> 32`) |
+| Stage 3 head | `UAVDynamicsActionHead` | Predicts smooth UAV waypoint/action chunks |
+
+Why the resampler is enabled from Stage 1: inserting it only at Stage 3 changes the visual distribution too late. Training `projector + resampler` together from Stage 1 lets Stage 2 and Stage 3 share the same visual interface.
 
 ## Repository Layout
 
 ```text
-Aeromamba/
-├── configs/                  # experiment and model configs
-├── data/                     # dataset loaders and local data notes
-├── docs/                     # reproducible environment + dataset guide
-├── inference/                # evaluation / serving code
-├── model/                    # core model modules
-├── scripts/                  # training launchers and utility scripts
-├── training/                 # stage1 / stage2 / stage3 training logic
-├── run_stage1_train.py       # stage 1 entry point
-├── requirements.txt          # Python dependencies
-└── Dockerfile                # optional container entry
+configs/      Experiment/config files
+data/         Dataset loader source code
+docs/         Environment and dataset notes
+inference/    Inference and evaluation helpers
+model/        AeroMamba model modules
+scripts/      Utility and launch scripts
+training/     Stage 1/2/3 training entry points
 ```
 
-## What Is Tracked
+## Environment
 
-Keep in Git:
+The tested remote environment is:
 
-- source code
-- configs
-- documentation
-- lightweight utility scripts
-- dependency manifests
+```bash
+conda activate mamba2
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -c "import transformers, timm; print(transformers.__version__, timm.__version__)"
+```
+
+Known working versions on the current server:
+
+- Python environment: `/root/miniconda3/envs/mamba2`
+- PyTorch: `2.1.1+cu118`
+- Transformers: `4.51.3`
+- timm: `1.0.27`
+- GPU: RTX 4090 24GB
+
+Recommended Hugging Face cache variables:
+
+```bash
+export HF_HOME=/root/autodl-tmp/hf_cache
+export HF_HUB_CACHE=/root/autodl-tmp/hf_cache/hub
+export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/datasets
+export TRANSFORMERS_CACHE=/root/autodl-tmp/hf_cache/hub
+export TORCH_HOME=/root/autodl-tmp/torch_cache
+export HF_ENDPOINT=https://hf-mirror.com
+export TOKENIZERS_PARALLELISM=false
+```
+
+## Dataset Layout
+
+Recommended server layout:
+
+```text
+/root/autodl-tmp/datasets/
+  stage1_llava_pretrain/
+    blip_laion_cc_sbu_558k.json
+    images/
+  stage2_aeromamba/
+    stage2_mixed_data.json
+    coco/train2017/
+    open3d_vqa/O3DVQA/
+  stage3_uavflow/
+    train-00000-of-00054.parquet
+    ...
+```
+
+Stage 1 uses the standard LLaVA-Pretrain 558K image-text alignment set.
+
+Stage 2 uses AeroMamba mixed VQA data. It is not COCO-only: `stage2_mixed_data.json` references both COCO `train2017` images and Open3D-VQA images under `open3d_vqa/O3DVQA`.
+
+Stage 3 uses UAV-Flow parquet shards. The current verified full split contains 54 shards and about 1.78M rows.
+
+Before training on a new server, verify that every referenced image path exists and that the UAV-Flow parquet shards load cleanly. Do not flatten or rename the Open3D-VQA directory tree.
+
+## Three-Stage Training
+
+### Stage 1: Projector + Resampler Alignment
+
+Train only the visual projector and Perceiver resampler. Vision and Mamba2 stay frozen.
+
+```bash
+python -u training/stage1_align.py \
+  --data_root /root/autodl-tmp/datasets/stage1_llava_pretrain \
+  --json_name blip_laion_cc_sbu_558k.json \
+  --vision_type siglip2_base_384 \
+  --mamba_type mamba-2-370m \
+  --token_resampler perceiver \
+  --num_visual_queries 32 \
+  --resampler_layers 2 \
+  --resampler_heads 8 \
+  --batch 8 \
+  --lr 1e-4 \
+  --epochs 1 \
+  --workers 6 \
+  --max_text_len 64 \
+  --log_every 500 \
+  --max_val_steps 100 \
+  --save_every_steps 10000 \
+  --save_dir checkpoints/base384_mamba2_resampler/stage1
+```
+
+Expected trainable modules:
+
+- `projector`
+- `token_resampler`
+
+### Stage 2: VLM SFT with LoRA
+
+Load Stage 1 projector/resampler weights, then train projector, resampler, and Mamba2 LoRA adapters.
+
+```bash
+python -u training/stage2_vlm.py \
+  --data_root /root/autodl-tmp/datasets/stage2_aeromamba \
+  --json_name stage2_mixed_data.json \
+  --stage1_ckpt checkpoints/base384_mamba2_resampler/stage1/best.pth \
+  --vision_type siglip2_base_384 \
+  --mamba_type mamba-2-370m \
+  --token_resampler perceiver \
+  --num_visual_queries 32 \
+  --resampler_layers 2 \
+  --resampler_heads 8 \
+  --lora_r 16 \
+  --lora_alpha 32 \
+  --batch 4 \
+  --lr 5e-5 \
+  --epochs 1 \
+  --workers 6 \
+  --max_text_len 64 \
+  --log_every 500 \
+  --max_val_steps 100 \
+  --save_every_steps 10000 \
+  --save_dir checkpoints/base384_mamba2_resampler/stage2
+```
+
+Expected trainable modules:
+
+- `projector`
+- `token_resampler`
+- Mamba2 LoRA adapter parameters
+
+### Stage 3: UAV-Flow Action Training
+
+Load Stage 2 checkpoint, then train the UAV action stack. The `uav_lite_siglip` preset selects `siglip2_base_384`, `mamba-2-370m`, `PerceiverResampler`, and the dynamics action head.
+
+```bash
+python -u training/stage3_action.py \
+  --arch_preset uav_lite_siglip \
+  --hf_dataset parquet \
+  --hf_data_files '/root/autodl-tmp/datasets/uav-flow/train-*.parquet' \
+  --hf_cache_dir /root/autodl-tmp/hf_cache/datasets \
+  --stage2_ckpt checkpoints/base384_mamba2_resampler/stage2/best.pth \
+  --epochs 2 \
+  --batch 4 \
+  --workers 6 \
+  --lr 5e-5 \
+  --log_every 500 \
+  --max_val_steps 100 \
+  --save_every_steps 10000 \
+  --save_dir checkpoints/base384_mamba2_resampler/stage3
+```
+
+Expected trainable modules:
+
+- `token_resampler`
+- `proprio_encoder`
+- `UAVDynamicsActionHead`
+- Mamba2 LoRA adapter parameters
+
+## Current Remote Pipeline
+
+The latest long-running server pipeline was launched under:
+
+```text
+/root/autodl-tmp/Aeromamba/checkpoints/base384_mamba2_resampler_<timestamp>/
+```
+
+It runs Stage 1, Stage 2, then Stage 3 sequentially and writes:
+
+```text
+pipeline.log
+pipeline.pid
+stage1/train.log
+stage2/train.log
+stage3/train.log
+```
+
+Monitor it with:
+
+```bash
+cd /root/autodl-tmp/Aeromamba
+RUN=$(cat checkpoints/latest_light_pipeline_run.txt)
+tail -f checkpoints/$RUN/stage1/train.log
+nvidia-smi
+```
+
+## Validation
+
+Basic syntax check:
+
+```bash
+python -m py_compile \
+  model/vision.py \
+  model/resampler.py \
+  model/action_head.py \
+  model/uav_mamba_vla.py \
+  training/trainer.py \
+  training/stage1_align.py \
+  training/stage2_vlm.py \
+  training/stage3_action.py
+```
+
+Training sanity criteria:
+
+- Stage 1: loss should trend downward over the first few thousand steps.
+- Stage 2: no NaN/OOM; validation CLM loss should not explode.
+- Stage 3: `main`, `smooth`, and `l1_err` should remain finite; keep FP32/no AMP if Smooth-L1 becomes unstable.
+
+## Git Hygiene
 
 Do not commit:
 
 - `checkpoints/`
-- dataset assets stored under `data/` (dataset loader source files remain tracked)
-- `*.pth`, `*.ckpt`, `*.pt`
-- `*.zip`, `*.tar.gz`, `*.part`
-- SSH keys and local credentials
+- downloaded datasets
+- model weights (`*.pth`, `*.pt`, `*.ckpt`, `*.safetensors`)
+- SSH keys or tokens
+- local cache/log artifacts
+- draft papers or large PDF references
 
-The ignore rules are in [`.gitignore`](./.gitignore).
-
-## Environment Setup
-
-The full setup and data-recovery workflow is documented in
-[`docs/STAGE1_STAGE2_ENV_AND_DATA_GUIDE.md`](./docs/STAGE1_STAGE2_ENV_AND_DATA_GUIDE.md).
-
-Typical flow:
-
-1. Verify Python, CUDA, and GPU availability.
-2. Install dependencies from `requirements.txt`.
-3. Prepare the dataset directory structure.
-4. Restore or download Stage 1 and Stage 2 datasets.
-5. Launch Stage 1 and Stage 2 training.
-6. Validate checkpoints and run inference smoke tests.
-
-## Dataset Paths
-
-The project expects a stable data root on the server:
-
-```text
-/root/Aeromamba/data/
-├── llava_pretrain/
-├── stage2_mixed_data.json
-├── llava_instruct_150k.json
-├── coco/
-│   └── train2017/
-└── open3d_vqa/
-    └── O3DVQA/
-        ├── EmbodiedCity/
-        ├── RealworldUAV/
-        ├── UrbanScene/
-        └── WildUAV/
-```
-
-Recommended Windows-side mirror:
-
-```text
-C:\Users\user\OneDrive - The University of Hong Kong - Connect\dataset\
-├── llava_pretrain\
-└── aeromamba\
-    ├── stage2_mixed_data.json
-    ├── coco\train2017\
-    └── open3d_vqa\O3DVQA\
-```
-
-Stage 2 is not a COCO-only dataset. Its mixed annotation file references both
-COCO and Open3D-VQA images. The three required Stage 2 components are:
-
-- project-generated `stage2_mixed_data.json`
-- COCO `train2017` images
-- Open3D-VQA images under `open3d_vqa/O3DVQA`
-
-Download COCO from the [official COCO image server](http://images.cocodataset.org/zips/train2017.zip).
-Open3D-VQA is published by EmbodiedCity through its
-[official Hugging Face dataset repository](https://huggingface.co/datasets/EmbodiedCity/Open3DVQA/tree/main)
-and [official code repository](https://github.com/EmbodiedCity/Open3D-VQA.code).
-The project-generated mixed JSON is not reproduced by either upstream download;
-restore it from the trusted AeroMamba backup.
-
-If the current environment changes, preserve the paths recorded in
-`stage2_mixed_data.json`. Do not flatten or rename the Open3D-VQA directories.
-Run the full path-integrity check in the detailed data guide before training.
-
-## Training Stages
-
-### Stage 1
-
-Stage 1 aligns the visual projector to the language model space using the LLaVA-Pretrain data.
-
-Recommended launcher:
-
-```bash
-python run_stage1_train.py
-```
-
-If you want the staged scripts directly:
-
-```bash
-python training/stage1_align.py --help
-python scripts/train_mamba.py --stage 1
-```
-
-### Stage 2
-
-Stage 2 fine-tunes the VLM stack with AeroMamba mixed annotations over COCO and
-Open3D-VQA images.
-
-Recommended launcher:
-
-```bash
-python training/stage2_vlm.py --help
-python scripts/train_mamba.py --stage 2
-```
-
-### Stage 3
-
-Stage 3 trains the action head and proprioception branch for downstream UAV control.
-
-```bash
-python training/stage3_action.py --help
-python scripts/train_mamba.py --stage 3
-```
-
-## Reproduce From Scratch
-
-1. Clone the repository and create a clean Python environment.
-2. Install dependencies from `requirements.txt`.
-3. Put the datasets in the exact folder structure documented above.
-4. Confirm the Stage 1 LLaVA-Pretrain JSON and image counts.
-5. Confirm every Stage 2 mixed-JSON path resolves to either a COCO or Open3D-VQA image.
-6. Start Stage 1 training and wait for a valid checkpoint.
-7. Start Stage 2 training from the Stage 1 checkpoint.
-8. Run the inference smoke test before any long experiment.
-
-## Useful Checks
-
-```bash
-python --version
-python -c "import torch; print(torch.cuda.is_available())"
-python -c "import json; print('ok')"
-```
-
-For dataset integrity, use the checks described in the docs guide instead of relying on file presence alone.
-
-## Notes
-
-- Keep training runs on `nohup`, `tmux`, or `screen` if the session is remote.
-- Do not commit private keys, backup archives, or model weights.
-- If you move to a new machine, treat the docs guide as the source of truth for data restore and launch order.
+Use `.gitignore` as the source of truth for excluded artifacts.

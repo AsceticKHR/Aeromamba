@@ -15,6 +15,7 @@ conda-env/
 # IDE/editor files
 .vscode/
 .idea/
+.omo/
 *.swp
 *.swo
 
@@ -67,6 +68,7 @@ data/*.part
 *.rar
 *.7z
 *.part
+*.pdf
 
 # Local credentials and keys
 id_rsa
@@ -79,3 +81,7 @@ id_rsa
 reports/*.json
 reports/*.csv
 *.log
+
+# Local assistant/project scratch files
+CLAUDE.md
+scripts/test_stage3_verify.py

@@ -154,7 +154,7 @@ def get_args():
         if args.lr == 5e-4:
             args.lr = 5e-5
     elif args.arch_preset == "uav_lite_siglip":
-        args.vision_type = "siglip2_so_384"
+        args.vision_type = "siglip2_base_384"
         if args.mamba_type == "mamba-130m":
             args.mamba_type = "mamba-2-370m"
         args.token_resampler = "perceiver"

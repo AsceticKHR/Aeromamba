@@ -539,6 +539,9 @@ class AeroMambaVLA(nn.Module):
             p.requires_grad = False
         for p in self.projector.parameters():
             p.requires_grad = True
+        if not isinstance(self.token_resampler, nn.Identity):
+            for p in self.token_resampler.parameters():
+                p.requires_grad = True
 
     def configure_stage2(self, lora_r: int = 16, lora_alpha: int = 32) -> None:
         """

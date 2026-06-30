@@ -42,6 +42,11 @@ from torchvision.transforms import Compose, Resize
 
 # Single-encoder presets
 SINGLE_ENCODERS: dict[str, Union[str, tuple[str, ...]]] = {
+    "siglip2_base_224": (),
+    "siglip2_base_256": (),
+    "siglip2_base_384": (),
+    "siglip2_base_p32_256": (),
+    "siglip2_large_384": (),
     "siglip2_so_384": (
         "vit_so400m_patch16_siglip2_384",
         "vit_so400m_patch16_siglip2_384.webli",
@@ -57,6 +62,11 @@ SINGLE_ENCODERS: dict[str, Union[str, tuple[str, ...]]] = {
 }
 
 SINGLE_IMG_SIZES: dict[str, int] = {
+    "siglip2_base_224": 224,
+    "siglip2_base_256": 256,
+    "siglip2_base_384": 384,
+    "siglip2_base_p32_256": 256,
+    "siglip2_large_384": 384,
     "siglip2_so_384": 384,
     "siglip_l_384":   384,
     "siglip_so_384":  384,
@@ -67,6 +77,11 @@ SINGLE_IMG_SIZES: dict[str, int] = {
 }
 
 HF_SINGLE_ENCODERS: dict[str, str] = {
+    "siglip2_base_224": "google/siglip2-base-patch16-224",
+    "siglip2_base_256": "google/siglip2-base-patch16-256",
+    "siglip2_base_384": "google/siglip2-base-patch16-384",
+    "siglip2_base_p32_256": "google/siglip2-base-patch32-256",
+    "siglip2_large_384": "google/siglip2-large-patch16-384",
     "siglip2_so_384": "google/siglip2-so400m-patch14-384",
 }
 

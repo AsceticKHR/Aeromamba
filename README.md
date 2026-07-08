@@ -1,36 +1,36 @@
 # AeroMamba
 
-AeroMamba is a lightweight staged vision-language-action (VLA) training stack for UAV navigation. The current training path uses a frozen SigLIP2 vision encoder, a Mamba2 language/state-space backbone, a learned visual token resampler, and a dynamics-aware UAV action head.
+AeroMamba is a lightweight staged vision-language-action (VLA) training stack for UAV navigation. The current full-stage recipe trains a SigLIP2 + Mamba2 model from Stage 1 alignment through Stage 3 UAV-Flow action learning.
 
-This repository tracks source code, training scripts, and reproducibility notes only. Datasets, checkpoints, local credentials, logs, and cache files must stay outside Git.
+This repository contains source code, launch scripts, and reproducibility notes only. Do not commit datasets, checkpoints, logs, credentials, or local evaluation outputs.
 
-## Current Recommended Architecture
+## Current Full-Stage Architecture
 
-| Component | Current default | Purpose |
+| Part | Current setting | Notes |
 | --- | --- | --- |
-| Vision encoder | `siglip2_base_384` (`google/siglip2-base-patch16-384`) | Frozen visual feature extractor with 384px input and 576 patch tokens |
-| Language backbone | `mamba-2-370m` (`state-spaces/mamba2-370m`) | Frozen base Mamba2 backbone with LoRA adapters in later stages |
-| Visual adapter | `MLPProjector` | Maps SigLIP2 visual features into Mamba hidden space |
-| Token compressor | `PerceiverResampler`, 32 queries | Reduces visual tokens before Mamba (`576 -> 32`) |
-| Stage 3 head | `UAVDynamicsActionHead` | Predicts smooth UAV waypoint/action chunks |
-
-Why the resampler is enabled from Stage 1: inserting it only at Stage 3 changes the visual distribution too late. Training `projector + resampler` together from Stage 1 lets Stage 2 and Stage 3 share the same visual interface.
+| Vision encoder | `siglip2_base_384` | Frozen SigLIP2 384px visual backbone |
+| Mamba backbone | `mamba-2-370m` | Frozen base backbone; LoRA is trained in Stage 2/3 |
+| Tokenizer | `EleutherAI/gpt-neox-20b` | Explicit tokenizer for Mamba/Mamba2; GPT-2 fallback is disabled |
+| Vision adapter | `MLPProjector` | Maps SigLIP2 hidden states into Mamba hidden space |
+| Token compressor | `PerceiverResampler`, 32 queries | Keeps visual sequence short and stable across all stages |
+| Stage 3 policy | `UAVDynamicsActionHead` + `action_context_fuser` | Uses language/state/vision/global summaries for UAV-Flow action chunks |
+| Stage 3 loss | Smooth-L1 + endpoint + direction + smoothness | Reduces mean-trajectory collapse and emphasizes navigation target direction |
 
 ## Repository Layout
 
 ```text
 configs/      Experiment/config files
-data/         Dataset loader source code
-docs/         Environment and dataset notes
-inference/    Inference and evaluation helpers
+data/         Dataset loaders and UAV-Flow preparation/validation scripts
+docs/         Reports and environment/data guides
+inference/    Inference server and evaluation helpers
 model/        AeroMamba model modules
-scripts/      Utility and launch scripts
+scripts/      Launch scripts
 training/     Stage 1/2/3 training entry points
 ```
 
 ## Environment
 
-The tested remote environment is:
+Tested server setup:
 
 ```bash
 conda activate mamba2
@@ -38,15 +38,15 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 python -c "import transformers, timm; print(transformers.__version__, timm.__version__)"
 ```
 
-Known working versions on the current server:
+Known working baseline:
 
-- Python environment: `/root/miniconda3/envs/mamba2`
+- Python env: `/root/miniconda3/envs/mamba2`
 - PyTorch: `2.1.1+cu118`
 - Transformers: `4.51.3`
 - timm: `1.0.27`
 - GPU: RTX 4090 24GB
 
-Recommended Hugging Face cache variables:
+Recommended cache variables:
 
 ```bash
 export HF_HOME=/root/autodl-tmp/hf_cache
@@ -56,186 +56,245 @@ export TRANSFORMERS_CACHE=/root/autodl-tmp/hf_cache/hub
 export TORCH_HOME=/root/autodl-tmp/torch_cache
 export HF_ENDPOINT=https://hf-mirror.com
 export TOKENIZERS_PARALLELISM=false
+export AEROMAMBA_TOKENIZER=EleutherAI/gpt-neox-20b
 ```
 
-## Dataset Layout
+Cache the tokenizer before full training:
+
+```bash
+python - <<'PY'
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+print(type(tok).__name__, tok.vocab_size)
+PY
+```
+
+## Data Preparation
 
 Recommended server layout:
 
 ```text
-/root/autodl-tmp/datasets/
-  stage1_llava_pretrain/
+/root/autodl-tmp/Aeromamba/data/
+  llava_pretrain/
     blip_laion_cc_sbu_558k.json
-    images/
-  stage2_aeromamba/
-    stage2_mixed_data.json
-    coco/train2017/
-    open3d_vqa/O3DVQA/
-  stage3_uavflow/
-    train-00000-of-00054.parquet
+    <LLaVA pretrain image folders>
+  stage2_mixed_data.json
+  coco/train2017/
+  open3d_vqa/O3DVQA/
+
+/root/autodl-tmp/datasets/uav-flow/
+  <trajectory_id>/
+    000000.jpg
+    000001.jpg
     ...
+    log.json
+  metadata/
+    manifest.jsonl
+    summary.json
 ```
 
-Stage 1 uses the standard LLaVA-Pretrain 558K image-text alignment set.
+### Stage 1 Data
 
-Stage 2 uses AeroMamba mixed VQA data. It is not COCO-only: `stage2_mixed_data.json` references both COCO `train2017` images and Open3D-VQA images under `open3d_vqa/O3DVQA`.
+Stage 1 uses the official LLaVA-Pretrain 558K image-text dataset:
 
-Stage 3 uses UAV-Flow parquet shards. The current verified full split contains 54 shards and about 1.78M rows.
+- `blip_laion_cc_sbu_558k.json`
+- corresponding LLaVA image folders
 
-Before training on a new server, verify that every referenced image path exists and that the UAV-Flow parquet shards load cleanly. Do not flatten or rename the Open3D-VQA directory tree.
+### Stage 2 Data
 
-## Three-Stage Training
+Stage 2 uses AeroMamba mixed VQA data:
+
+- `stage2_mixed_data.json`
+- COCO `train2017`
+- Open3D-VQA under `open3d_vqa/O3DVQA`
+
+Do not flatten or rename Open3D-VQA. The JSON references the original directory structure.
+
+### Stage 3 Data
+
+Stage 3 uses UAV-Flow converted into official folder-style trajectories. Build from parquet shards:
+
+```bash
+cd /root/autodl-tmp/Aeromamba
+
+python data/prepare_uavflow_stage3.py \
+  --parquet_glob "/root/autodl-tmp/datasets/uav-flow/train-*.parquet" \
+  --output_dir "/root/autodl-tmp/datasets/uav-flow" \
+  --split train \
+  --chunk_size 5 \
+  --hf_cache_dir "/root/autodl-tmp/hf_cache/datasets" \
+  --verify_images
+```
+
+Validate:
+
+```bash
+python data/validate_uavflow_stage3.py \
+  --data_root "/root/autodl-tmp/datasets/uav-flow" \
+  --chunk_size 5 \
+  --report "/root/autodl-tmp/Aeromamba/checkpoints/stage3_uavflow_validate.json"
+```
+
+A verified full conversion should report:
+
+- `rows = 1785284`
+- `written_trajectories = 26795`
+- `bad_rows = 0`
+- `incomplete_buffers = 0`
+
+The Stage 3 loader uses `instruction_unified`/`instruction` and prefers official `preprocessed_logs` for body-frame action labels.
+
+## One-Command Full Training
+
+Use the full-stage script:
+
+```bash
+cd /root/autodl-tmp/Aeromamba
+
+nohup env \
+  HF_ENDPOINT=https://hf-mirror.com \
+  HF_HOME=/root/autodl-tmp/hf_cache \
+  AEROMAMBA_TOKENIZER=EleutherAI/gpt-neox-20b \
+  RUN_NAME=uavflow_mamba2_siglip2_fast_$(date +%Y%m%d_%H%M%S) \
+  STAGE1_BATCH=12 STAGE1_WORKERS=16 STAGE1_EPOCHS=1 \
+  STAGE2_BATCH=8 STAGE2_WORKERS=16 STAGE2_EPOCHS=2 \
+  STAGE3_BATCH=24 STAGE3_WORKERS=24 STAGE3_EPOCHS=2 \
+  bash scripts/run_uavflow_three_stage_pipeline.sh \
+  > checkpoints/full_stage_training.log 2>&1 < /dev/null &
+```
+
+Monitor:
+
+```bash
+RUN=$(cat checkpoints/latest_uavflow_pipeline_run.txt)
+tail -f "checkpoints/${RUN}.log"
+nvidia-smi
+```
+
+Outputs:
+
+```text
+checkpoints/<RUN>/
+  stage1/
+  stage2/
+  stage3/
+checkpoints/<RUN>.log
+checkpoints/<RUN>.pid
+```
+
+## Manual Stage Commands
 
 ### Stage 1: Projector + Resampler Alignment
 
-Train only the visual projector and Perceiver resampler. Vision and Mamba2 stay frozen.
-
 ```bash
-python -u training/stage1_align.py \
-  --data_root /root/autodl-tmp/datasets/stage1_llava_pretrain \
+python training/stage1_align.py \
+  --data_root /root/autodl-tmp/Aeromamba/data/llava_pretrain \
   --json_name blip_laion_cc_sbu_558k.json \
-  --vision_type siglip2_base_384 \
   --mamba_type mamba-2-370m \
+  --vision_type siglip2_base_384 \
   --token_resampler perceiver \
   --num_visual_queries 32 \
   --resampler_layers 2 \
   --resampler_heads 8 \
-  --batch 8 \
-  --lr 1e-4 \
+  --batch 12 \
+  --workers 16 \
   --epochs 1 \
-  --workers 6 \
+  --lr 1e-4 \
   --max_text_len 64 \
-  --log_every 500 \
-  --max_val_steps 100 \
-  --save_every_steps 10000 \
-  --save_dir checkpoints/base384_mamba2_resampler/stage1
+  --save_dir checkpoints/full_stage/stage1
 ```
 
-Expected trainable modules:
-
-- `projector`
-- `token_resampler`
+Trainable modules: `projector`, `token_resampler`.
 
 ### Stage 2: VLM SFT with LoRA
 
-Load Stage 1 projector/resampler weights, then train projector, resampler, and Mamba2 LoRA adapters.
-
 ```bash
-python -u training/stage2_vlm.py \
-  --data_root /root/autodl-tmp/datasets/stage2_aeromamba \
+python training/stage2_vlm.py \
+  --data_root /root/autodl-tmp/Aeromamba/data \
   --json_name stage2_mixed_data.json \
-  --stage1_ckpt checkpoints/base384_mamba2_resampler/stage1/best.pth \
-  --vision_type siglip2_base_384 \
+  --stage1_ckpt checkpoints/full_stage/stage1/best.pth \
   --mamba_type mamba-2-370m \
+  --vision_type siglip2_base_384 \
   --token_resampler perceiver \
   --num_visual_queries 32 \
   --resampler_layers 2 \
   --resampler_heads 8 \
   --lora_r 16 \
   --lora_alpha 32 \
-  --batch 4 \
+  --batch 8 \
+  --workers 16 \
+  --epochs 2 \
   --lr 5e-5 \
-  --epochs 1 \
-  --workers 6 \
-  --max_text_len 64 \
-  --log_every 500 \
-  --max_val_steps 100 \
-  --save_every_steps 10000 \
-  --save_dir checkpoints/base384_mamba2_resampler/stage2
+  --max_text_len 128 \
+  --save_dir checkpoints/full_stage/stage2
 ```
 
-Expected trainable modules:
-
-- `projector`
-- `token_resampler`
-- Mamba2 LoRA adapter parameters
+Trainable modules: `projector`, `token_resampler`, Mamba2 LoRA adapters.
 
 ### Stage 3: UAV-Flow Action Training
 
-Load Stage 2 checkpoint, then train the UAV action stack. The `uav_lite_siglip` preset selects `siglip2_base_384`, `mamba-2-370m`, `PerceiverResampler`, and the dynamics action head.
-
 ```bash
-python -u training/stage3_action.py \
+python training/stage3_action.py \
   --arch_preset uav_lite_siglip \
-  --hf_dataset parquet \
-  --hf_data_files '/root/autodl-tmp/datasets/uav-flow/train-*.parquet' \
-  --hf_cache_dir /root/autodl-tmp/hf_cache/datasets \
-  --stage2_ckpt checkpoints/base384_mamba2_resampler/stage2/best.pth \
+  --data_root /root/autodl-tmp/datasets/uav-flow \
+  --stage2_ckpt checkpoints/full_stage/stage2/best.pth \
+  --mamba_type mamba-2-370m \
+  --batch 24 \
+  --workers 24 \
   --epochs 2 \
-  --batch 4 \
-  --workers 6 \
   --lr 5e-5 \
-  --log_every 500 \
-  --max_val_steps 100 \
-  --save_every_steps 10000 \
-  --save_dir checkpoints/base384_mamba2_resampler/stage3
+  --chunk_size 5 \
+  --pos_scale 100.0 \
+  --lambda_smooth 0.05 \
+  --lambda_endpoint 0.7 \
+  --lambda_direction 0.2 \
+  --max_text_len 64 \
+  --stage3_train_lora \
+  --no_amp \
+  --save_dir checkpoints/full_stage/stage3
 ```
 
-Expected trainable modules:
-
-- `token_resampler`
-- `proprio_encoder`
-- `UAVDynamicsActionHead`
-- Mamba2 LoRA adapter parameters
-
-## Current Remote Pipeline
-
-The latest long-running server pipeline was launched under:
-
-```text
-/root/autodl-tmp/Aeromamba/checkpoints/base384_mamba2_resampler_<timestamp>/
-```
-
-It runs Stage 1, Stage 2, then Stage 3 sequentially and writes:
-
-```text
-pipeline.log
-pipeline.pid
-stage1/train.log
-stage2/train.log
-stage3/train.log
-```
-
-Monitor it with:
-
-```bash
-cd /root/autodl-tmp/Aeromamba
-RUN=$(cat checkpoints/latest_light_pipeline_run.txt)
-tail -f checkpoints/$RUN/stage1/train.log
-nvidia-smi
-```
+Trainable modules: `token_resampler`, `proprio_encoder`, `action_context_fuser`, `UAVDynamicsActionHead`, Mamba2 LoRA adapters.
 
 ## Validation
 
-Basic syntax check:
+Syntax check:
 
 ```bash
 python -m py_compile \
-  model/vision.py \
-  model/resampler.py \
+  data/dataset.py \
+  data/prepare_uavflow_stage3.py \
+  data/validate_uavflow_stage3.py \
   model/action_head.py \
   model/uav_mamba_vla.py \
-  training/trainer.py \
   training/stage1_align.py \
   training/stage2_vlm.py \
   training/stage3_action.py
 ```
 
-Training sanity criteria:
+Training sanity:
 
-- Stage 1: loss should trend downward over the first few thousand steps.
-- Stage 2: no NaN/OOM; validation CLM loss should not explode.
-- Stage 3: `main`, `smooth`, and `l1_err` should remain finite; keep FP32/no AMP if Smooth-L1 becomes unstable.
+- Stage 1 loss should decrease in the first few hundred steps.
+- Stage 2 validation CLM loss should remain finite and trend down.
+- Stage 3 should log finite `main`, `endpoint`, `direction`, `smooth`, and `l1_err`.
+- If Stage 3 OOMs, reduce `STAGE3_BATCH` first; if dataloader stalls, reduce `STAGE3_WORKERS`.
+
+## Reports
+
+Useful design and debugging notes are in:
+
+- `docs/UAVFLOW_STAGE3_DATA_PREP.md`
+- `docs/aeromamba_improved_architecture_report.md`
+- `docs/aeromamba_stage3_action_collapse_diagnosis.md`
+- `docs/aeromamba_uav_flow_eval_framework.md`
 
 ## Git Hygiene
 
-Do not commit:
+Never commit:
 
 - `checkpoints/`
 - downloaded datasets
-- model weights (`*.pth`, `*.pt`, `*.ckpt`, `*.safetensors`)
+- model weights: `*.pth`, `*.pt`, `*.ckpt`, `*.safetensors`
 - SSH keys or tokens
-- local cache/log artifacts
-- draft papers or large PDF references
-
-Use `.gitignore` as the source of truth for excluded artifacts.
+- local eval outputs: `eval_results/`, `eval_smoke_jsons/`
+- logs, caches, archives, temporary documents

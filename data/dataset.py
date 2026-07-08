@@ -123,10 +123,18 @@ class UAVFlowDataset(Dataset):
         self.aug_flip     = aug_flip and (split == "train")
         self.split        = split
 
-        # Collect all trajectory files
-        self.traj_files: List[Path] = sorted(
-            self.data_root.rglob(f"*{json_extension}")
-        )
+        # Collect trajectory files. Supports both the legacy AeroMamba list
+        # format and the official UAV-Flow folder format:
+        #   <trajectory_id>/000000.jpg
+        #   <trajectory_id>/log.json
+        if json_extension == ".json":
+            official_logs = sorted(self.data_root.rglob("log.json"))
+            legacy_files = sorted(
+                path for path in self.data_root.rglob("*.json") if path.name != "log.json"
+            )
+            self.traj_files = official_logs + legacy_files
+        else:
+            self.traj_files = sorted(self.data_root.rglob(f"*{json_extension}"))
         if not self.traj_files:
             raise FileNotFoundError(
                 f"No {json_extension} files found under {data_root}. "
@@ -138,8 +146,7 @@ class UAVFlowDataset(Dataset):
         self.trajectories: List[List[Dict[str, Any]]] = []
 
         for traj_idx, traj_path in enumerate(self.traj_files):
-            with open(traj_path, "r", encoding="utf-8") as f:
-                traj = json.load(f)
+            traj = self._load_trajectory(traj_path)
             if not isinstance(traj, list) or len(traj) < chunk_size:
                 continue
             self.trajectories.append(traj)
@@ -191,6 +198,102 @@ class UAVFlowDataset(Dataset):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def _load_trajectory(self, traj_path: Path) -> List[Dict[str, Any]]:
+        with open(traj_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict) and "raw_logs" in payload:
+            return self._convert_official_log(payload, traj_path)
+        return []
+
+    def _convert_official_log(
+        self,
+        payload: Dict[str, Any],
+        log_path: Path,
+    ) -> List[Dict[str, Any]]:
+        preprocessed_logs = payload.get("preprocessed_logs") or []
+        raw_logs = payload.get("raw_logs") or []
+        length = int(payload.get("length") or len(preprocessed_logs) or len(raw_logs))
+        if length <= 0:
+            return []
+
+        instruction = (
+            payload.get("instruction_unified")
+            or payload.get("instruction")
+            or "Navigate the UAV along the planned trajectory."
+        )
+        traj_dir = log_path.parent
+        traj = []
+        for idx in range(length):
+            image_path = traj_dir / f"{idx:06d}.jpg"
+            if not image_path.exists():
+                continue
+            pose = self._pose_from_preprocessed_log(
+                preprocessed_logs[idx] if idx < len(preprocessed_logs) else None
+            )
+            if pose is None:
+                pose = self._pose_from_raw_log(raw_logs[idx] if idx < len(raw_logs) else [])
+                pos_unit_scale = 1.0
+            else:
+                pos_unit_scale = self.pos_scale
+            traj.append(
+                {
+                    "image_path": str(image_path.relative_to(self.data_root)).replace("\\", "/"),
+                    "instruction": instruction,
+                    "state": [
+                        [0.0, 0.0, 0.0],
+                        [pose["roll_deg"], pose["yaw_deg"], pose["pitch_deg"]],
+                    ],
+                    "pose_cm": [
+                        pose["x_cm"] * pos_unit_scale,
+                        pose["y_cm"] * pos_unit_scale,
+                        pose["z_cm"] * pos_unit_scale,
+                        pose["yaw_deg"],
+                    ],
+                }
+            )
+        return traj
+
+    @staticmethod
+    def _pose_from_raw_log(raw: Any) -> Dict[str, float]:
+        values = []
+        if isinstance(raw, (list, tuple)):
+            for value in raw:
+                try:
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    values.append(0.0)
+        while len(values) < 6:
+            values.append(0.0)
+        return {
+            "x_cm": values[0],
+            "y_cm": values[1],
+            "z_cm": values[2],
+            "roll_deg": values[3],
+            "yaw_deg": values[4],
+            "pitch_deg": values[5],
+        }
+
+    @staticmethod
+    def _pose_from_preprocessed_log(preprocessed: Any) -> Optional[Dict[str, float]]:
+        if not isinstance(preprocessed, (list, tuple)) or len(preprocessed) < 6:
+            return None
+        try:
+            values = [float(value) for value in preprocessed[:6]]
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in values):
+            return None
+        return {
+            "x_cm": values[0],
+            "y_cm": values[1],
+            "z_cm": values[2],
+            "roll_deg": values[3],
+            "yaw_deg": values[4],
+            "pitch_deg": values[5],
+        }
+
     def _load_image(
         self,
         step: Dict,
@@ -228,6 +331,9 @@ class UAVFlowDataset(Dataset):
         start: int,
     ) -> torch.Tensor:
         """Extract K consecutive normalised actions as ground truth chunk."""
+        if "pose_cm" in traj[start]:
+            return self._extract_body_frame_chunk(traj, start)
+
         chunk = []
         for k in range(self.chunk_size):
             step = traj[start + k]
@@ -241,6 +347,31 @@ class UAVFlowDataset(Dataset):
             norm_action = normalize_action(raw_action, self.pos_scale)
             chunk.append(norm_action)
         return torch.tensor(np.stack(chunk), dtype=torch.float32)  # [K, 4]
+
+    def _extract_body_frame_chunk(
+        self,
+        traj: List[Dict],
+        start: int,
+    ) -> torch.Tensor:
+        anchor_pose = traj[start].get("pose_cm", [0.0, 0.0, 0.0, 0.0])
+        x0, y0, z0, yaw0 = [float(value) for value in anchor_pose[:4]]
+        yaw0_rad = math.radians(yaw0)
+        cos_yaw = math.cos(yaw0_rad)
+        sin_yaw = math.sin(yaw0_rad)
+
+        chunk = []
+        for k in range(self.chunk_size):
+            step = traj[start + k]
+            pose = step.get("pose_cm", anchor_pose)
+            x, y, z, yaw = [float(value) for value in pose[:4]]
+            dx_world = x - x0
+            dy_world = y - y0
+            forward = cos_yaw * dx_world + sin_yaw * dy_world
+            right = -sin_yaw * dx_world + cos_yaw * dy_world
+            up = z - z0
+            dyaw = (yaw - yaw0 + 180.0) % 360.0 - 180.0
+            chunk.append(normalize_action([forward, right, up, dyaw], self.pos_scale))
+        return torch.tensor(np.stack(chunk), dtype=torch.float32)
 
 
 class UAVFlowHFDataset(Dataset):
@@ -320,22 +451,33 @@ class UAVFlowHFDataset(Dataset):
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         pixel_values = self.transform(img)
 
-        input_ids = self._tokenize(self.instruction)
-        raw_logs = self._parse_raw_logs(row.get("log", ""))
+        log_payload = self._parse_log_payload(row.get("log", ""))
+        # Use LLM-diversified instruction first (matches official UAV-Flow), fallback to unified
+        instruction = (
+            log_payload.get("instruction")
+            or log_payload.get("instruction_unified")
+            or self.instruction
+        )
+        input_ids = self._tokenize(instruction)
 
-        anchor = raw_logs[0]
-        yaw0 = float(anchor[4]) if len(anchor) > 4 else 0.0
+        # preprocessed_logs: [x, y, z, roll_rad, pitch_rad, yaw_rad] — local Cartesian, yaw in radians
+        # raw_logs: [x, y, z, roll_deg, pitch_deg, yaw_deg, timestamp] — yaw in degrees
+        preprocessed_logs = self._parse_preprocessed_logs(log_payload)
+        raw_logs, motion_pos_scale = self._parse_motion_logs(log_payload)
+
+        # Proprioception: use actual state from preprocessed_logs (not zeros)
+        anchor_pp = preprocessed_logs[0]
         proprio = torch.tensor(
             [
-                0.0,
-                0.0,
-                0.0,
-                math.radians(yaw0),
+                float(anchor_pp[0]),
+                float(anchor_pp[1]),
+                float(anchor_pp[2]),
+                float(anchor_pp[4]) if len(anchor_pp) > 4 else 0.0,
             ],
             dtype=torch.float32,
         )
 
-        gt_action = self._extract_relative_actions(raw_logs)
+        gt_action = self._extract_relative_actions(raw_logs, motion_pos_scale=motion_pos_scale)
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
@@ -447,12 +589,19 @@ class UAVFlowHFDataset(Dataset):
             input_ids.extend([pad_id] * (self.max_text_len - len(input_ids)))
         return torch.tensor(input_ids, dtype=torch.long)
 
-    def _parse_raw_logs(self, log_text: str) -> List[List[float]]:
-        try:
-            payload = json.loads(log_text)
-            raw_logs = payload.get("raw_logs", [])
-        except Exception:
-            raw_logs = []
+    def _parse_log_payload(self, log_value: Any) -> Dict[str, Any]:
+        if isinstance(log_value, dict):
+            return log_value
+        if isinstance(log_value, str):
+            try:
+                payload = json.loads(log_value)
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _parse_raw_logs(self, payload: Dict[str, Any]) -> List[List[float]]:
+        raw_logs = payload.get("raw_logs", [])
 
         rows = []
         for row in raw_logs:
@@ -470,22 +619,71 @@ class UAVFlowHFDataset(Dataset):
             rows.append(rows[-1])
         return rows
 
+    def _parse_motion_logs(self, payload: Dict[str, Any]) -> Tuple[List[List[float]], float]:
+        preprocessed_logs = payload.get("preprocessed_logs", [])
+        rows = []
+        for row in preprocessed_logs:
+            if isinstance(row, (list, tuple)) and len(row) >= 6:
+                try:
+                    values = [float(x) for x in row[:6]]
+                except (TypeError, ValueError):
+                    continue
+                if all(math.isfinite(value) for value in values):
+                    rows.append(values)
+        if rows:
+            while len(rows) < self.chunk_size:
+                rows.append(rows[-1])
+            return rows, self.pos_scale
+        return self._parse_raw_logs(payload), 1.0
+
+    def _parse_preprocessed_logs(self, payload: Dict[str, Any]) -> List[List[float]]:
+        """
+        Parse preprocessed_logs: local Cartesian [x, y, z, roll_rad, pitch_rad, yaw_rad].
+        Yaw is in radians (unlike raw_logs which uses degrees).
+        """
+        pp_logs = payload.get("preprocessed_logs", [])
+
+        rows = []
+        for row in pp_logs:
+            if isinstance(row, (list, tuple)) and len(row) >= 3:
+                try:
+                    values = [float(x) for x in row]
+                except (TypeError, ValueError):
+                    continue
+                if all(math.isfinite(value) for value in values):
+                    rows.append(values)
+
+        if not rows:
+            rows = [0.0] * 6
+        while len(rows) < self.chunk_size:
+            rows.append(rows[-1])
+        return rows
+
     @staticmethod
     def _yaw_delta_deg(yaw: float, yaw0: float) -> float:
         return (yaw - yaw0 + 180.0) % 360.0 - 180.0
 
-    def _extract_relative_actions(self, raw_logs: List[List[float]]) -> torch.Tensor:
+    def _extract_relative_actions(
+        self,
+        raw_logs: List[List[float]],
+        motion_pos_scale: float = 1.0,
+    ) -> torch.Tensor:
         anchor = raw_logs[0]
         x0, y0, z0 = float(anchor[0]), float(anchor[1]), float(anchor[2])
         yaw0 = float(anchor[4]) if len(anchor) > 4 else 0.0
+        yaw0_rad = math.radians(yaw0)
+        cos_yaw = math.cos(yaw0_rad)
+        sin_yaw = math.sin(yaw0_rad)
 
         actions = []
         for row in raw_logs[: self.chunk_size]:
             yaw = float(row[4]) if len(row) > 4 else yaw0
+            dx_world = float(row[0]) - x0
+            dy_world = float(row[1]) - y0
             raw_action = [
-                float(row[0]) - x0,
-                float(row[1]) - y0,
-                float(row[2]) - z0,
+                (cos_yaw * dx_world + sin_yaw * dy_world) * motion_pos_scale,
+                (-sin_yaw * dx_world + cos_yaw * dy_world) * motion_pos_scale,
+                (float(row[2]) - z0) * motion_pos_scale,
                 self._yaw_delta_deg(yaw, yaw0),
             ]
             actions.append(normalize_action(raw_action, self.pos_scale))

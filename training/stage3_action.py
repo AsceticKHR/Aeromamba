@@ -82,6 +82,8 @@ class Stage3Trainer(BaseTrainer):
             gt_action=gt_action,
             return_loss=True,
             lambda_smooth=getattr(self.args, "lambda_smooth", 0.1),
+            lambda_endpoint=getattr(self.args, "lambda_endpoint", 0.5),
+            lambda_direction=getattr(self.args, "lambda_direction", 0.2),
         )
         return pred["loss"], pred.get("loss_detail", {})
 
@@ -126,6 +128,8 @@ def get_args():
     p.add_argument("--lora_r",         type=int,   default=16, help="LoRA rank (must match Stage 2)")
     p.add_argument("--lora_alpha",     type=int,   default=32, help="LoRA alpha (must match Stage 2)")
     p.add_argument("--lambda_smooth",  type=float, default=0.1)
+    p.add_argument("--lambda_endpoint", type=float, default=0.5)
+    p.add_argument("--lambda_direction", type=float, default=0.2)
     p.add_argument("--pos_scale",      type=float, default=100.0)
     p.add_argument("--aug_flip",       action="store_true")
     p.add_argument("--val_frac",       type=float, default=0.1)

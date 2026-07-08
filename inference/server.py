@@ -108,6 +108,56 @@ def preprocess_instruction(instr: str) -> torch.Tensor:
     return tokens["input_ids"].to(_device)
 
 
+def postprocess_actions(
+    actions: np.ndarray,
+    proprio_list: list,
+) -> list:
+    """
+    Convert model-normalised actions into UAV-Flow-Eval episode-local poses.
+
+    Stage-3 training predicts normalised future offsets.  UAV-Flow-Eval,
+    however, expects each returned action to be an episode-local pose:
+        [relative_x, relative_y, relative_z, relative_yaw_rad]
+    where the evaluator then rotates it by the episode initial yaw and writes
+    the corresponding Unreal pose.
+    """
+    output_pos_scale = getattr(_args, "output_pos_scale", None)
+    if output_pos_scale is None:
+        output_pos_scale = getattr(_args, "pos_scale", 100.0)
+
+    current_x = float(proprio_list[0]) if len(proprio_list) > 0 else 0.0
+    current_y = float(proprio_list[1]) if len(proprio_list) > 1 else 0.0
+    current_z = float(proprio_list[2]) if len(proprio_list) > 2 else 0.0
+    current_yaw_deg = float(proprio_list[3]) if len(proprio_list) > 3 else 0.0
+    current_yaw_rad = float(np.radians(current_yaw_deg))
+
+    frame = getattr(_args, "output_frame", "delta_local")
+    processed = []
+    for action in actions:
+        x = float(action[0]) * output_pos_scale
+        y = float(action[1]) * output_pos_scale
+        z = float(action[2]) * output_pos_scale
+        yaw_rad = float(action[3])
+
+        if frame == "delta_local":
+            cos_yaw = float(np.cos(current_yaw_rad))
+            sin_yaw = float(np.sin(current_yaw_rad))
+            episode_x = current_x + x * cos_yaw - y * sin_yaw
+            episode_y = current_y + x * sin_yaw + y * cos_yaw
+            episode_z = current_z + z
+            episode_yaw = current_yaw_rad + yaw_rad
+        else:
+            episode_x = x
+            episode_y = y
+            episode_z = z
+            episode_yaw = yaw_rad
+
+        episode_yaw = (episode_yaw + np.pi) % (2.0 * np.pi) - np.pi
+        processed.append([episode_x, episode_y, episode_z, float(episode_yaw)])
+
+    return processed
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,18 +189,24 @@ def predict():
         chunk = pred["action"][0]         # [K, 4]  on device
 
         # Temporal ensemble → smooth single action [4]
-        smooth_action = _ensemble.update(chunk.cpu())
+        raw_chunk = chunk.detach().float().cpu()
+        smooth_action = _ensemble.update(raw_chunk)
 
         # Build response
         if getattr(_args, "ensemble_mode", False):
             # Return one temporally ensembled action per step
-            action_out = [smooth_action.tolist()]
+            raw_actions = smooth_action.unsqueeze(0).numpy()
         else:
             # Return full K-step chunk; client executes sequentially
-            action_out = chunk.cpu().tolist()
+            raw_actions = raw_chunk.numpy()
+
+        action_out = postprocess_actions(raw_actions, proprio_l)
 
         elapsed_ms = (time.time() - t0) * 1000
-        logger.info(f"Inference: {elapsed_ms:.1f} ms | action[0]={action_out[0]}")
+        logger.info(
+            f"Inference: {elapsed_ms:.1f} ms | "
+            f"raw[0]={raw_actions[0].tolist()} | action[0]={action_out[0]}"
+        )
         return jsonify({"action": action_out, "done": False})
 
     except Exception as exc:
@@ -182,7 +238,19 @@ def load_model(args) -> AeroMambaVLA:
         vision_type=args.vision_type,
         chunk_size=args.chunk_size,
         freeze_vision=True,
+        token_resampler=args.token_resampler,
+        num_visual_queries=args.num_visual_queries,
+        resampler_layers=args.resampler_layers,
+        resampler_heads=args.resampler_heads,
+        action_head_type=args.action_head_type,
+        action_bound=args.action_bound,
     )
+    if args.use_lora:
+        logger.info(
+            f"Applying LoRA adapters before checkpoint load: "
+            f"r={args.lora_r}, alpha={args.lora_alpha}"
+        )
+        model.configure_stage2(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
     if args.ckpt and Path(args.ckpt).exists():
         logger.info(f"Loading checkpoint: {args.ckpt}")
         ckpt  = torch.load(args.ckpt, map_location="cpu")
@@ -204,11 +272,33 @@ def get_args():
     p.add_argument("--mamba_type",      default="mamba-370m")
     p.add_argument("--vision_type",     default="siglip_l_384")
     p.add_argument("--chunk_size",      type=int,   default=5)
+    p.add_argument("--token_resampler", default="none", choices=["none", "perceiver"])
+    p.add_argument("--num_visual_queries", type=int, default=32)
+    p.add_argument("--resampler_layers", type=int, default=2)
+    p.add_argument("--resampler_heads", type=int, default=8)
+    p.add_argument("--action_head_type", default="mlp", choices=["mlp", "dynamics"])
+    p.add_argument("--action_bound",    type=float, default=1.0)
+    p.add_argument("--use_lora",        action="store_true",
+                   help="Build Mamba LoRA adapters before loading a LoRA checkpoint")
+    p.add_argument("--lora_r",          type=int, default=16)
+    p.add_argument("--lora_alpha",      type=int, default=32)
     p.add_argument("--port",            type=int,   default=5007)
     p.add_argument("--host",            default="0.0.0.0")
     p.add_argument("--max_text_len",    type=int,   default=64)
     p.add_argument("--pos_scale",       type=float, default=100.0,
                    help="Position scaling divisor (cm → normalised)")
+    p.add_argument("--output_pos_scale", type=float, default=None,
+                   help=(
+                       "Multiplier for predicted xyz before returning to "
+                       "UAV-Flow-Eval. Defaults to --pos_scale."
+                   ))
+    p.add_argument("--output_frame", default="delta_local",
+                   choices=["delta_local", "episode_local"],
+                   help=(
+                       "delta_local: rotate/add predicted offsets to current "
+                       "episode-local pose; episode_local: return scaled model "
+                       "outputs directly."
+                   ))
     p.add_argument("--ensemble_window", type=int,   default=5)
     p.add_argument("--ensemble_decay",  type=float, default=0.7)
     p.add_argument("--ensemble_mode",   action="store_true",

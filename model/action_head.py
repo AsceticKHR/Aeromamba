@@ -198,6 +198,8 @@ def aero_action_loss(
     pred:          dict,
     gt_action:     torch.Tensor,    # [B, K, 4]  (Δx, Δy, Δz, Δyaw_rad)
     lambda_smooth: float = 0.1,
+    lambda_endpoint: float = 0.5,
+    lambda_direction: float = 0.2,
 ) -> tuple:
     """
     Unified action-chunk loss.
@@ -223,6 +225,19 @@ def aero_action_loss(
     # Intuitive Metric: Exact L1 distance
     l1_err = F.l1_loss(pred_action, gt_action)
 
+    loss_endpoint = F.smooth_l1_loss(pred_action[:, -1], gt_action[:, -1], beta=0.1)
+
+    pred_xy = pred_action[:, -1, :2]
+    gt_xy = gt_action[:, -1, :2]
+    pred_norm = pred_xy.norm(dim=-1)
+    gt_norm = gt_xy.norm(dim=-1)
+    valid_direction = (pred_norm > 1e-4) & (gt_norm > 1e-4)
+    if valid_direction.any():
+        cosine = F.cosine_similarity(pred_xy[valid_direction], gt_xy[valid_direction], dim=-1)
+        loss_direction = (1.0 - cosine).mean()
+    else:
+        loss_direction = pred_action.new_zeros(())
+
     # Smoothness: penalise jerk (2nd-order finite difference along K dimension)
     if pred_action.size(1) >= 3:
         d1 = pred_action[:, 1:] - pred_action[:, :-1]   # velocity  [B, K-1, 4]
@@ -231,9 +246,16 @@ def aero_action_loss(
     else:
         loss_smooth = pred_action.new_zeros(()).squeeze()
 
-    total  = loss_main + lambda_smooth * loss_smooth
+    total = (
+        loss_main
+        + lambda_smooth * loss_smooth
+        + lambda_endpoint * loss_endpoint
+        + lambda_direction * loss_direction
+    )
     detail = {
-        "main":   loss_main.item(),
+        "main": loss_main.item(),
+        "endpoint": loss_endpoint.item(),
+        "direction": loss_direction.item(),
         "smooth": loss_smooth.item(),
         "l1_err": l1_err.item(),
     }

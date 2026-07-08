@@ -29,6 +29,8 @@ checkpoints/
 runs/
 outputs/
 logs/
+eval_results/
+eval_smoke_jsons/
 *.pth
 *.pt
 *.ckpt
@@ -69,6 +71,7 @@ data/*.part
 *.7z
 *.part
 *.pdf
+*.docx
 
 # Local credentials and keys
 id_rsa
@@ -85,3 +88,4 @@ reports/*.csv
 # Local assistant/project scratch files
 CLAUDE.md
 scripts/test_stage3_verify.py
+resume.docx

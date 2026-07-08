@@ -81,6 +81,17 @@ MAMBA_PRESETS: dict[str, str] = {
     "mamba-zephyr": "xiuyul/mamba-2.8b-zephyr",
 }
 
+MAMBA_TOKENIZER_PRESETS: dict[str, str] = {
+    "mamba-130m": "EleutherAI/gpt-neox-20b",
+    "mamba-370m": "EleutherAI/gpt-neox-20b",
+    "mamba-790m": "EleutherAI/gpt-neox-20b",
+    "mamba-1.4b": "EleutherAI/gpt-neox-20b",
+    "mamba-2.8b": "EleutherAI/gpt-neox-20b",
+    "mamba2-370m": "EleutherAI/gpt-neox-20b",
+    "mamba-2-370m": "EleutherAI/gpt-neox-20b",
+    "mamba-zephyr": "HuggingFaceH4/zephyr-7b-beta",
+}
+
 # Default LoRA target modules for Mamba's SSM projections
 MAMBA_LORA_TARGETS = ["in_proj", "out_proj", "x_proj", "dt_proj"]
 
@@ -249,15 +260,19 @@ class AeroMambaVLA(nn.Module):
                     ) from e
                 print(f"\n[AeroMambaVLA] Warning: Failed to load pretrained Mamba weights ({e}). Initializing with random weights.")
                 self.mamba = _init_random_mamba(mamba_type)
+            tokenizer_name = os.environ.get(
+                "AEROMAMBA_TOKENIZER",
+                MAMBA_TOKENIZER_PRESETS.get(mamba_type, hub_name),
+            )
             try:
-                self.tokenizer = AutoTokenizer.from_pretrained(hub_name)
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
             except Exception as e:
-                print(f"\n[AeroMambaVLA] Warning: Failed to load tokenizer from {hub_name} ({e}). Falling back to GPT-2/Mock tokenizer.")
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                except Exception as e2:
-                    print(f"[AeroMambaVLA] Warning: Failed to load gpt2 tokenizer ({e2}). Using MockTokenizer.")
-                    self.tokenizer = MockTokenizer()
+                raise RuntimeError(
+                    f"Failed to load tokenizer {tokenizer_name!r} for {mamba_type}. "
+                    "Cache/install it first or set AEROMAMBA_TOKENIZER explicitly. "
+                    "Refusing to silently fall back to GPT-2 because that corrupts "
+                    "Stage1/2 language supervision."
+                ) from e
             if getattr(self.tokenizer, "pad_token", None) is None:
                 self.tokenizer.pad_token = (
                     getattr(self.tokenizer, "eos_token", None)
@@ -319,6 +334,13 @@ class AeroMambaVLA(nn.Module):
                 f"Unknown action_head_type '{action_head_type}'. "
                 "Choose from: 'mlp', 'dynamics'."
             )
+
+        self.action_context_fuser = nn.Sequential(
+            nn.LayerNorm(D_m * 4),
+            nn.Linear(D_m * 4, D_m),
+            nn.SiLU(),
+            nn.Linear(D_m, D_m),
+        )
 
         # Store key dimensions
         self.D_m = D_m
@@ -406,6 +428,8 @@ class AeroMambaVLA(nn.Module):
         cache_params=None,
         return_loss:   bool  = False,
         lambda_smooth: float = 0.1,
+        lambda_endpoint: float = 0.5,
+        lambda_direction: float = 0.2,
     ) -> dict:
         """
         Multimodal forward pass.
@@ -459,7 +483,19 @@ class AeroMambaVLA(nn.Module):
         # [B, L + 1 + N_vis, D_m]
 
         # ── 6. Global token: last hidden state (RoboMamba convention) ─────────
-        global_token = hidden[:, -1, :]    # [B, D_m]
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0)
+        text_mask = (input_ids != pad_id).to(text_embs.dtype)
+        text_denom = text_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        text_summary = (
+            hidden[:, : input_ids.size(1), :] * text_mask.unsqueeze(-1)
+        ).sum(dim=1) / text_denom
+        prop_summary = hidden[:, input_ids.size(1), :]
+        vision_summary = hidden[:, input_ids.size(1) + 1 :, :].mean(dim=1)
+        global_token = hidden[:, -1, :]
+        fused_context = self.action_context_fuser(
+            torch.cat([global_token, text_summary, prop_summary, vision_summary], dim=-1)
+        )
+        global_token = global_token + fused_context
 
         # ── 7. Action chunking head ───────────────────────────────────────────
         pred = self.action_head(global_token, proprio=proprio)   # {"action": [B, K, 4]}
@@ -467,7 +503,11 @@ class AeroMambaVLA(nn.Module):
         # ── 8. Loss (training only) ───────────────────────────────────────────
         if return_loss and gt_action is not None:
             loss, detail = aero_action_loss(
-                pred, gt_action, lambda_smooth=lambda_smooth
+                pred,
+                gt_action,
+                lambda_smooth=lambda_smooth,
+                lambda_endpoint=lambda_endpoint,
+                lambda_direction=lambda_direction,
             )
             pred["loss"]        = loss
             pred["loss_detail"] = detail
@@ -568,6 +608,8 @@ class AeroMambaVLA(nn.Module):
         if not isinstance(self.token_resampler, nn.Identity):
             for p in self.token_resampler.parameters():
                 p.requires_grad = True
+        for p in self.action_context_fuser.parameters():
+            p.requires_grad = True
         if train_lora:
             for name, p in self.mamba.named_parameters():
                 if "lora_" in name:

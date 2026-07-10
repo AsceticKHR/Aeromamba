@@ -12,9 +12,11 @@ This repository contains source code, launch scripts, and reproducibility notes 
 | Mamba backbone | `mamba-2-370m` | Frozen base backbone; LoRA is trained in Stage 2/3 |
 | Tokenizer | `EleutherAI/gpt-neox-20b` | Explicit tokenizer for Mamba/Mamba2; GPT-2 fallback is disabled |
 | Vision adapter | `MLPProjector` | Maps SigLIP2 hidden states into Mamba hidden space |
-| Token compressor | `PerceiverResampler`, 32 queries | Keeps visual sequence short and stable across all stages |
-| Stage 3 policy | `UAVDynamicsActionHead` + `action_context_fuser` | Uses language/state/vision/global summaries for UAV-Flow action chunks |
-| Stage 3 loss | Smooth-L1 + endpoint + direction + smoothness | Reduces mean-trajectory collapse and emphasizes navigation target direction |
+| Token compressor | `PerceiverResampler`, 64 queries | Keeps visual sequence short while preserving UAV scene detail |
+| Unified sequence | `[state, delta_state, vision, language]` | Same causal token order in Stage 1/2/3; Stage 1/2 use zero state tokens |
+| UAV state | 8D `state8` + 8D `delta_state8` | `[x,y,z,yaw,vx,vy,vz,yaw_rate]` for dynamics-aware conditioning |
+| Stage 3 policy | `UAVActionHead` MLP | Fast AnoleVLA-style continuous K x 4 waypoint chunk regression |
+| Stage 3 loss | S3a Smooth-L1 + 2x endpoint; S3b adds `lambda_acc` | Stable first, then add trajectory-difference regularization |
 
 ## Repository Layout
 
@@ -121,7 +123,7 @@ python data/prepare_uavflow_stage3.py \
   --parquet_glob "/root/autodl-tmp/datasets/uav-flow/train-*.parquet" \
   --output_dir "/root/autodl-tmp/datasets/uav-flow" \
   --split train \
-  --chunk_size 5 \
+  --chunk_size 8 \
   --hf_cache_dir "/root/autodl-tmp/hf_cache/datasets" \
   --verify_images
 ```
@@ -131,7 +133,7 @@ Validate:
 ```bash
 python data/validate_uavflow_stage3.py \
   --data_root "/root/autodl-tmp/datasets/uav-flow" \
-  --chunk_size 5 \
+  --chunk_size 8 \
   --report "/root/autodl-tmp/Aeromamba/checkpoints/stage3_uavflow_validate.json"
 ```
 
@@ -143,6 +145,8 @@ A verified full conversion should report:
 - `incomplete_buffers = 0`
 
 The Stage 3 loader uses `instruction_unified`/`instruction` and prefers official `preprocessed_logs` for body-frame action labels.
+
+AeroMamba-Opt refuses fixed Stage 3 instruction fallback during training. Validate that `missing_instruction = 0`, `zero_action_trajectories = 0`, and `zero_state_trajectories = 0` before full training.
 
 ## One-Command Full Training
 
@@ -193,7 +197,7 @@ python training/stage1_align.py \
   --mamba_type mamba-2-370m \
   --vision_type siglip2_base_384 \
   --token_resampler perceiver \
-  --num_visual_queries 32 \
+  --num_visual_queries 64 \
   --resampler_layers 2 \
   --resampler_heads 8 \
   --batch 12 \
@@ -216,7 +220,7 @@ python training/stage2_vlm.py \
   --mamba_type mamba-2-370m \
   --vision_type siglip2_base_384 \
   --token_resampler perceiver \
-  --num_visual_queries 32 \
+  --num_visual_queries 64 \
   --resampler_layers 2 \
   --resampler_heads 8 \
   --lora_r 16 \
@@ -235,7 +239,7 @@ Trainable modules: `projector`, `token_resampler`, Mamba2 LoRA adapters.
 
 ```bash
 python training/stage3_action.py \
-  --arch_preset uav_lite_siglip \
+  --arch_preset aeromamba_opt \
   --data_root /root/autodl-tmp/datasets/uav-flow \
   --stage2_ckpt checkpoints/full_stage/stage2/best.pth \
   --mamba_type mamba-2-370m \
@@ -243,18 +247,17 @@ python training/stage3_action.py \
   --workers 24 \
   --epochs 2 \
   --lr 5e-5 \
-  --chunk_size 5 \
+  --chunk_size 8 \
   --pos_scale 100.0 \
-  --lambda_smooth 0.05 \
-  --lambda_endpoint 0.7 \
-  --lambda_direction 0.2 \
+  --lambda_smooth 0.0 \
+  --lambda_endpoint 2.0 \
+  --lambda_direction 0.0 \
   --max_text_len 64 \
-  --stage3_train_lora \
   --no_amp \
   --save_dir checkpoints/full_stage/stage3
 ```
 
-Trainable modules: `token_resampler`, `proprio_encoder`, `action_context_fuser`, `UAVDynamicsActionHead`, Mamba2 LoRA adapters.
+Trainable modules in S3a: `token_resampler`, `proprio_encoder`, `UAVActionHead`. For S3b, resume and add `--stage3_train_lora --lambda_acc 0.5`.
 
 ## Validation
 
@@ -276,7 +279,7 @@ Training sanity:
 
 - Stage 1 loss should decrease in the first few hundred steps.
 - Stage 2 validation CLM loss should remain finite and trend down.
-- Stage 3 should log finite `main`, `endpoint`, `direction`, `smooth`, and `l1_err`.
+- Stage 3 should log finite `main`, `endpoint`, `acc`, `smooth`, and `l1_err`; `direction` is optional and defaults to 0.
 - If Stage 3 OOMs, reduce `STAGE3_BATCH` first; if dataloader stalls, reduce `STAGE3_WORKERS`.
 
 ## Reports

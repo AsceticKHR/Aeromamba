@@ -73,17 +73,24 @@ class Stage3Trainer(BaseTrainer):
         pixels    = _to_device(batch["pixel_values"], device)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         proprio   = batch["proprio"].to(device, non_blocking=True)
+        state     = batch.get("state8", proprio).to(device, non_blocking=True)
+        delta_state = batch.get("delta_state8")
+        if delta_state is not None:
+            delta_state = delta_state.to(device, non_blocking=True)
         gt_action = batch["gt_action"].to(device, non_blocking=True)
 
         pred = model(
             pixel_values=pixels,
             input_ids=input_ids,
             proprio=proprio,
+            state=state,
+            delta_state=delta_state,
             gt_action=gt_action,
             return_loss=True,
             lambda_smooth=getattr(self.args, "lambda_smooth", 0.1),
-            lambda_endpoint=getattr(self.args, "lambda_endpoint", 0.5),
-            lambda_direction=getattr(self.args, "lambda_direction", 0.2),
+            lambda_endpoint=getattr(self.args, "lambda_endpoint", 2.0),
+            lambda_direction=getattr(self.args, "lambda_direction", 0.0),
+            lambda_acc=getattr(self.args, "lambda_acc", 0.0),
         )
         return pred["loss"], pred.get("loss_detail", {})
 
@@ -97,7 +104,13 @@ def get_args():
     p.add_argument(
         "--arch_preset",
         default="none",
-        choices=["none", "uav_lite_compatible", "uav_lite_siglip"],
+        choices=[
+            "none",
+            "uav_lite_compatible",
+            "uav_lite_siglip",
+            "aeromamba_opt",
+            "aeromamba_opt_fast",
+        ],
         help=(
             "Architecture preset. 'uav_lite_compatible' keeps the existing "
             "DinoSigLIP Stage-2 projector but adds Perceiver resampling and "
@@ -121,15 +134,17 @@ def get_args():
     p.add_argument("--action_head_type", default="mlp", choices=["mlp", "dynamics"])
     p.add_argument("--action_bound",   type=float, default=1.0)
     p.add_argument("--stage3_train_lora", action="store_true", help="Keep Mamba LoRA adapters trainable in Stage 3.")
+    p.add_argument("--proprio_dim",    type=int,   default=8)
     p.add_argument("--chunk_size",     type=int,   default=5)
     p.add_argument("--epochs",         type=int,   default=3)
     p.add_argument("--batch",          type=int,   default=4)
     p.add_argument("--lr",             type=float, default=5e-4)
     p.add_argument("--lora_r",         type=int,   default=16, help="LoRA rank (must match Stage 2)")
     p.add_argument("--lora_alpha",     type=int,   default=32, help="LoRA alpha (must match Stage 2)")
-    p.add_argument("--lambda_smooth",  type=float, default=0.1)
-    p.add_argument("--lambda_endpoint", type=float, default=0.5)
-    p.add_argument("--lambda_direction", type=float, default=0.2)
+    p.add_argument("--lambda_smooth",  type=float, default=0.0)
+    p.add_argument("--lambda_endpoint", type=float, default=2.0)
+    p.add_argument("--lambda_direction", type=float, default=0.0)
+    p.add_argument("--lambda_acc",     type=float, default=0.0)
     p.add_argument("--pos_scale",      type=float, default=100.0)
     p.add_argument("--aug_flip",       action="store_true")
     p.add_argument("--val_frac",       type=float, default=0.1)
@@ -141,6 +156,7 @@ def get_args():
     p.add_argument("--dummy_size",     type=int,   default=100)
     p.add_argument("--log_every",      type=int,   default=5)
     p.add_argument("--max_steps",      type=int,   default=None, help="Optional max train batches per epoch.")
+    p.add_argument("--split_seed",     type=int,   default=42)
     p.add_argument("--max_val_steps",  type=int,   default=100, help="Optional max validation batches.")
     p.add_argument("--no_amp",         action="store_true", help="Disable CUDA autocast/GradScaler for numerical stability.")
     p.add_argument("--save_every_steps", type=int, default=None, help="Save latest.pth every N training steps.")
@@ -167,6 +183,36 @@ def get_args():
         args.resampler_heads = 8
         args.action_head_type = "dynamics"
         args.stage3_train_lora = True
+        args.no_amp = True
+        if args.lr == 5e-4:
+            args.lr = 5e-5
+    elif args.arch_preset == "aeromamba_opt":
+        args.vision_type = "siglip2_base_384"
+        if args.mamba_type == "mamba-130m":
+            args.mamba_type = "mamba-2-370m"
+        args.token_resampler = "perceiver"
+        args.num_visual_queries = 64
+        args.resampler_layers = 2
+        args.resampler_heads = 8
+        args.action_head_type = "mlp"
+        args.proprio_dim = 8
+        if args.chunk_size == 5:
+            args.chunk_size = 8
+        args.no_amp = True
+        if args.lr == 5e-4:
+            args.lr = 5e-5
+    elif args.arch_preset == "aeromamba_opt_fast":
+        args.vision_type = "siglip2_base_p32_256"
+        if args.mamba_type == "mamba-130m":
+            args.mamba_type = "mamba-2-370m"
+        args.token_resampler = "perceiver"
+        args.num_visual_queries = 32
+        args.resampler_layers = 2
+        args.resampler_heads = 8
+        args.action_head_type = "mlp"
+        args.proprio_dim = 8
+        if args.chunk_size == 5:
+            args.chunk_size = 8
         args.no_amp = True
         if args.lr == 5e-4:
             args.lr = 5e-5

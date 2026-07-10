@@ -197,9 +197,10 @@ UAVActionChunkHead = UAVActionHead
 def aero_action_loss(
     pred:          dict,
     gt_action:     torch.Tensor,    # [B, K, 4]  (Δx, Δy, Δz, Δyaw_rad)
-    lambda_smooth: float = 0.1,
-    lambda_endpoint: float = 0.5,
-    lambda_direction: float = 0.2,
+    lambda_smooth: float = 0.0,
+    lambda_endpoint: float = 2.0,
+    lambda_direction: float = 0.0,
+    lambda_acc: float = 0.0,
 ) -> tuple:
     """
     Unified action-chunk loss.
@@ -246,17 +247,26 @@ def aero_action_loss(
     else:
         loss_smooth = pred_action.new_zeros(()).squeeze()
 
+    if pred_action.size(1) >= 2:
+        pred_delta = pred_action[:, 1:] - pred_action[:, :-1]
+        gt_delta = gt_action[:, 1:] - gt_action[:, :-1]
+        loss_acc = F.l1_loss(pred_delta, gt_delta)
+    else:
+        loss_acc = pred_action.new_zeros(()).squeeze()
+
     total = (
         loss_main
         + lambda_smooth * loss_smooth
         + lambda_endpoint * loss_endpoint
         + lambda_direction * loss_direction
+        + lambda_acc * loss_acc
     )
     detail = {
         "main": loss_main.item(),
         "endpoint": loss_endpoint.item(),
         "direction": loss_direction.item(),
         "smooth": loss_smooth.item(),
+        "acc": loss_acc.item(),
         "l1_err": l1_err.item(),
     }
     return total, detail

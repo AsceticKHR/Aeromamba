@@ -16,9 +16,6 @@ from __future__ import annotations
 import argparse
 import sys
 import math
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
 from pathlib import Path
 
 import torch
@@ -61,7 +58,8 @@ class Stage1Trainer(BaseTrainer):
         val_frac = getattr(args, "val_frac", 0.1)
         n_val    = max(1, int(len(ds) * val_frac))
         n_train  = len(ds) - n_val
-        train_ds, val_ds = random_split(ds, [n_train, n_val])
+        split_gen = torch.Generator().manual_seed(getattr(args, "split_seed", 42))
+        train_ds, val_ds = random_split(ds, [n_train, n_val], generator=split_gen)
         print(f"[Trainer] Dataset: {n_train} train  |  {n_val} val")
         return train_ds, val_ds
 
@@ -79,14 +77,23 @@ class Stage1Trainer(BaseTrainer):
         with torch.no_grad():
             vis_patches = model._encode_vision(pixels)     # [B, N_vis, D_v]
         vis_tokens  = model.projector(vis_patches)          # [B, N_vis, D_m] (requires grad)
+        vis_tokens  = model.token_resampler(vis_tokens)
 
         # ── 2. Text path: Mamba embed ─────────────────────────────────────────
         with torch.no_grad():
             text_embs = model._embed_text(input_ids)       # [B, L, D_m] (frozen embeddings)
 
         # ── 3. Concatenate: [vision | text] ───────────────────────────────────
-        # Causal order for autoregressive generation: vision tokens first, then text
-        inputs_embeds = torch.cat([vis_tokens, text_embs], dim=1)  # [B, N_vis + L, D_m]
+        zero_state = torch.zeros(
+            input_ids.size(0),
+            model.proprio_encoder.proprio_dim,
+            device=device,
+            dtype=text_embs.dtype,
+        )
+        state_tokens = model.proprio_encoder.forward_pair(zero_state, zero_state)
+
+        # AeroMamba-Opt order: [state | delta_state | vision | text]
+        inputs_embeds = torch.cat([state_tokens, vis_tokens, text_embs], dim=1)
 
         # ── 4. Mamba backbone pass ────────────────────────────────────────────
         # Activations inside Mamba blocks are stored for backpropagation to projector
@@ -108,8 +115,8 @@ class Stage1Trainer(BaseTrainer):
         # ── 6. Shift logits and labels for next-token prediction ─────────────
         # Logits at index i predict token at index i+1
         # Target labels are corresponding to the text segment which starts at index N_vis
-        N_vis = vis_tokens.size(1)
-        shift_logits = logits[:, N_vis - 1 : -1, :].contiguous()  # [B, L, Vocab]
+        prefix_len = state_tokens.size(1) + vis_tokens.size(1)
+        shift_logits = logits[:, prefix_len - 1 : -1, :].contiguous()  # [B, L, Vocab]
         shift_labels = labels.contiguous()                        # [B, L]
 
         # CrossEntropyLoss (will ignore -100 labels)
@@ -141,22 +148,24 @@ def get_args():
     p.add_argument("--dummy",         action="store_true",     help="Keep for compatibility, not active")
     p.add_argument("--data_root",     default="./data/llava_subset", help="Path to LLaVA subset folder")
     p.add_argument("--json_name",     default="llava_subset.json")
-    p.add_argument("--mamba_type",    default="mamba-370m")
-    p.add_argument("--vision_type",   default="dinosiglip_so_384")
-    p.add_argument("--token_resampler", default="none", choices=["none", "perceiver"])
-    p.add_argument("--num_visual_queries", type=int, default=32)
+    p.add_argument("--mamba_type",    default="mamba-2-370m")
+    p.add_argument("--vision_type",   default="siglip2_base_384")
+    p.add_argument("--token_resampler", default="perceiver", choices=["none", "perceiver"])
+    p.add_argument("--num_visual_queries", type=int, default=64)
     p.add_argument("--resampler_layers", type=int, default=2)
     p.add_argument("--resampler_heads", type=int, default=8)
+    p.add_argument("--proprio_dim",   type=int,   default=8)
     p.add_argument("--chunk_size",    type=int,   default=5)
     p.add_argument("--epochs",        type=int,   default=3)
     p.add_argument("--batch",         type=int,   default=16)
-    p.add_argument("--lr",            type=float, default=1e-3)
+    p.add_argument("--lr",            type=float, default=1e-4)
     p.add_argument("--val_frac",      type=float, default=0.1)
     p.add_argument("--save_dir",      default="./checkpoints/stage1")
     p.add_argument("--workers",       type=int,   default=4)
     p.add_argument("--max_text_len",  type=int,   default=128)
     p.add_argument("--log_every",     type=int,   default=5)
     p.add_argument("--max_steps",     type=int,   default=None)
+    p.add_argument("--split_seed",    type=int,   default=42)
     p.add_argument("--max_val_steps", type=int,   default=100)
     p.add_argument("--no_amp",        action="store_true")
     p.add_argument("--save_every_steps", type=int, default=None)

@@ -75,6 +75,22 @@ def parse_proprio(state: List[List[float]]) -> np.ndarray:
     return np.array(rel_xyz + [rel_yaw], dtype=np.float32)  # [4]
 
 
+def parse_state8(state: List[List[float]]) -> np.ndarray:
+    """
+    Extract AeroMamba-Opt 8D state:
+      [x, y, z, yaw_rad, vx, vy, vz, yaw_rate_rad]
+    """
+    pose = parse_proprio(state)
+    velocity = [0.0, 0.0, 0.0, 0.0]
+    if len(state) > 2 and isinstance(state[2], (list, tuple)):
+        for idx, value in enumerate(state[2][:4]):
+            try:
+                velocity[idx] = float(value)
+            except (TypeError, ValueError):
+                velocity[idx] = 0.0
+    return np.concatenate([pose, np.asarray(velocity, dtype=np.float32)]).astype(np.float32)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,7 +188,8 @@ class UAVFlowDataset(Dataset):
 
         # ── Image ────────────────────────────────────────────────────────────
         img = self._load_image(anchor, traj_idx, step_idx)
-        if self.aug_flip and random.random() < 0.5:
+        do_flip = self.aug_flip and random.random() < 0.5
+        if do_flip:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         # transform may return a plain tensor (single encoder)
         # or a dict {"dino": ..., "siglip": ...} (DinoSigLIPTransform)
@@ -185,14 +202,28 @@ class UAVFlowDataset(Dataset):
         # ── Proprioception ────────────────────────────────────────────────────
         state  = anchor.get("state", [[0, 0, 0], [0, 0, 0]])
         proprio = torch.tensor(parse_proprio(state), dtype=torch.float32)
+        state8 = torch.tensor(parse_state8(state), dtype=torch.float32)
+        if step_idx > 0:
+            prev_state = traj[step_idx - 1].get("state", [[0, 0, 0], [0, 0, 0]])
+            prev_state8 = torch.tensor(parse_state8(prev_state), dtype=torch.float32)
+            delta_state8 = state8 - prev_state8
+        else:
+            delta_state8 = torch.zeros_like(state8)
 
         # ── Ground-truth action chunk (K steps) ───────────────────────────────
         gt_action = self._extract_chunk(traj, step_idx)  # [K, 4]
+        if do_flip:
+            proprio = self._flip_proprio(proprio)
+            state8 = self._flip_state8(state8)
+            delta_state8 = self._flip_state8(delta_state8)
+            gt_action = self._flip_action(gt_action)
 
         return {
             "pixel_values": pixel_values,   # Tensor [3,H,W] or dict of Tensors
             "input_ids":    input_ids,
             "proprio":      proprio,
+            "state8":       state8,
+            "delta_state8": delta_state8,
             "gt_action":    gt_action,
         }
 
@@ -221,8 +252,10 @@ class UAVFlowDataset(Dataset):
         instruction = (
             payload.get("instruction_unified")
             or payload.get("instruction")
-            or "Navigate the UAV along the planned trajectory."
         )
+        if not instruction:
+            return []
+        raw_origin = self._raw_xyz(raw_logs[0] if raw_logs else [])
         traj_dir = log_path.parent
         traj = []
         for idx in range(length):
@@ -233,18 +266,34 @@ class UAVFlowDataset(Dataset):
                 preprocessed_logs[idx] if idx < len(preprocessed_logs) else None
             )
             if pose is None:
-                pose = self._pose_from_raw_log(raw_logs[idx] if idx < len(raw_logs) else [])
+                pose = self._pose_from_raw_log(
+                    raw_logs[idx] if idx < len(raw_logs) else [],
+                    raw_origin=raw_origin,
+                )
                 pos_unit_scale = 1.0
             else:
                 pos_unit_scale = self.pos_scale
+            state_pose = [pose["x_m"], pose["y_m"], pose["z_m"]]
+            state_att = [pose["roll_deg"], pose["yaw_deg"], pose["pitch_deg"]]
+            if traj:
+                prev_state = traj[-1]["state"]
+                prev_pose = prev_state[0]
+                prev_yaw = math.radians(prev_state[1][1])
+                yaw = math.radians(pose["yaw_deg"])
+                dyaw = (yaw - prev_yaw + math.pi) % (2 * math.pi) - math.pi
+                velocity = [
+                    state_pose[0] - prev_pose[0],
+                    state_pose[1] - prev_pose[1],
+                    state_pose[2] - prev_pose[2],
+                    dyaw,
+                ]
+            else:
+                velocity = [0.0, 0.0, 0.0, 0.0]
             traj.append(
                 {
                     "image_path": str(image_path.relative_to(self.data_root)).replace("\\", "/"),
                     "instruction": instruction,
-                    "state": [
-                        [0.0, 0.0, 0.0],
-                        [pose["roll_deg"], pose["yaw_deg"], pose["pitch_deg"]],
-                    ],
+                    "state": [state_pose, state_att, velocity],
                     "pose_cm": [
                         pose["x_cm"] * pos_unit_scale,
                         pose["y_cm"] * pos_unit_scale,
@@ -256,7 +305,23 @@ class UAVFlowDataset(Dataset):
         return traj
 
     @staticmethod
-    def _pose_from_raw_log(raw: Any) -> Dict[str, float]:
+    def _raw_xyz(raw: Any) -> tuple[float, float, float]:
+        values = []
+        if isinstance(raw, (list, tuple)):
+            for value in raw[:3]:
+                try:
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    values.append(0.0)
+        while len(values) < 3:
+            values.append(0.0)
+        return values[0], values[1], values[2]
+
+    @staticmethod
+    def _pose_from_raw_log(
+        raw: Any,
+        raw_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> Dict[str, float]:
         values = []
         if isinstance(raw, (list, tuple)):
             for value in raw:
@@ -266,10 +331,16 @@ class UAVFlowDataset(Dataset):
                     values.append(0.0)
         while len(values) < 6:
             values.append(0.0)
+        rel_x = values[0] - raw_origin[0]
+        rel_y = values[1] - raw_origin[1]
+        rel_z = values[2] - raw_origin[2]
         return {
-            "x_cm": values[0],
-            "y_cm": values[1],
-            "z_cm": values[2],
+            "x_m": rel_x,
+            "y_m": rel_y,
+            "z_m": rel_z,
+            "x_cm": rel_x,
+            "y_cm": rel_y,
+            "z_cm": rel_z,
             "roll_deg": values[3],
             "yaw_deg": values[4],
             "pitch_deg": values[5],
@@ -286,6 +357,9 @@ class UAVFlowDataset(Dataset):
         if not all(math.isfinite(value) for value in values):
             return None
         return {
+            "x_m": values[0],
+            "y_m": values[1],
+            "z_m": values[2],
             "x_cm": values[0],
             "y_cm": values[1],
             "z_cm": values[2],
@@ -373,6 +447,32 @@ class UAVFlowDataset(Dataset):
             chunk.append(normalize_action([forward, right, up, dyaw], self.pos_scale))
         return torch.tensor(np.stack(chunk), dtype=torch.float32)
 
+    @staticmethod
+    def _flip_proprio(proprio: torch.Tensor) -> torch.Tensor:
+        flipped = proprio.clone()
+        if flipped.numel() >= 2:
+            flipped[1] = -flipped[1]
+        if flipped.numel() >= 4:
+            flipped[3] = -flipped[3]
+        return flipped
+
+    @staticmethod
+    def _flip_state8(state: torch.Tensor) -> torch.Tensor:
+        flipped = state.clone()
+        for idx in (1, 3, 5, 7):
+            if flipped.numel() > idx:
+                flipped[idx] = -flipped[idx]
+        return flipped
+
+    @staticmethod
+    def _flip_action(action: torch.Tensor) -> torch.Tensor:
+        flipped = action.clone()
+        if flipped.ndim >= 2 and flipped.size(-1) >= 2:
+            flipped[..., 1] = -flipped[..., 1]
+        if flipped.ndim >= 2 and flipped.size(-1) >= 4:
+            flipped[..., 3] = -flipped[..., 3]
+        return flipped
+
 
 class UAVFlowHFDataset(Dataset):
     """
@@ -447,7 +547,8 @@ class UAVFlowHFDataset(Dataset):
         row = self._get_local_parquet_row(int(idx)) if self._logical_cumsum else self.ds[int(idx)]
 
         img = self._coerce_image(row["image"])
-        if self.aug_flip and random.random() < 0.5:
+        do_flip = self.aug_flip and random.random() < 0.5
+        if do_flip:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         pixel_values = self.transform(img)
 
@@ -456,12 +557,13 @@ class UAVFlowHFDataset(Dataset):
         instruction = (
             log_payload.get("instruction")
             or log_payload.get("instruction_unified")
-            or self.instruction
         )
+        if not instruction:
+            raise ValueError("UAV-Flow sample is missing instruction; refusing fixed fallback.")
         input_ids = self._tokenize(instruction)
 
-        # preprocessed_logs: [x, y, z, roll_rad, pitch_rad, yaw_rad] — local Cartesian, yaw in radians
-        # raw_logs: [x, y, z, roll_deg, pitch_deg, yaw_deg, timestamp] — yaw in degrees
+        # preprocessed_logs/raw_logs use local/world Cartesian positions and
+        # [roll_deg, yaw_deg, pitch_deg] orientation ordering.
         preprocessed_logs = self._parse_preprocessed_logs(log_payload)
         raw_logs, motion_pos_scale = self._parse_motion_logs(log_payload)
 
@@ -472,16 +574,31 @@ class UAVFlowHFDataset(Dataset):
                 float(anchor_pp[0]),
                 float(anchor_pp[1]),
                 float(anchor_pp[2]),
-                float(anchor_pp[4]) if len(anchor_pp) > 4 else 0.0,
+                math.radians(float(anchor_pp[4])) if len(anchor_pp) > 4 else 0.0,
             ],
+            dtype=torch.float32,
+        )
+        state8 = torch.tensor(
+            self._state8_from_preprocessed(preprocessed_logs, 0),
+            dtype=torch.float32,
+        )
+        delta_state8 = torch.tensor(
+            self._state8_delta_from_preprocessed(preprocessed_logs, 0),
             dtype=torch.float32,
         )
 
         gt_action = self._extract_relative_actions(raw_logs, motion_pos_scale=motion_pos_scale)
+        if do_flip:
+            proprio = UAVFlowDataset._flip_proprio(proprio)
+            state8 = UAVFlowDataset._flip_state8(state8)
+            delta_state8 = UAVFlowDataset._flip_state8(delta_state8)
+            gt_action = UAVFlowDataset._flip_action(gt_action)
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "proprio": proprio,
+            "state8": state8,
+            "delta_state8": delta_state8,
             "gt_action": gt_action,
         }
 
@@ -638,8 +755,7 @@ class UAVFlowHFDataset(Dataset):
 
     def _parse_preprocessed_logs(self, payload: Dict[str, Any]) -> List[List[float]]:
         """
-        Parse preprocessed_logs: local Cartesian [x, y, z, roll_rad, pitch_rad, yaw_rad].
-        Yaw is in radians (unlike raw_logs which uses degrees).
+        Parse preprocessed_logs: local Cartesian [x, y, z, roll_deg, yaw_deg, pitch_deg].
         """
         pp_logs = payload.get("preprocessed_logs", [])
 
@@ -654,10 +770,40 @@ class UAVFlowHFDataset(Dataset):
                     rows.append(values)
 
         if not rows:
-            rows = [0.0] * 6
+            rows = [[0.0] * 6]
         while len(rows) < self.chunk_size:
             rows.append(rows[-1])
         return rows
+
+    @staticmethod
+    def _pose4_from_preprocessed(row: List[float]) -> np.ndarray:
+        yaw = math.radians(float(row[4])) if len(row) > 4 else 0.0
+        return np.asarray([float(row[0]), float(row[1]), float(row[2]), yaw], dtype=np.float32)
+
+    def _velocity4_from_preprocessed(self, rows: List[List[float]], idx: int) -> np.ndarray:
+        if idx <= 0 or idx >= len(rows):
+            return np.zeros(4, dtype=np.float32)
+        current = self._pose4_from_preprocessed(rows[idx])
+        previous = self._pose4_from_preprocessed(rows[idx - 1])
+        delta = current - previous
+        delta[3] = (delta[3] + math.pi) % (2 * math.pi) - math.pi
+        return delta.astype(np.float32)
+
+    def _state8_from_preprocessed(self, rows: List[List[float]], idx: int) -> np.ndarray:
+        idx = min(max(idx, 0), len(rows) - 1)
+        pose = self._pose4_from_preprocessed(rows[idx])
+        velocity = self._velocity4_from_preprocessed(rows, idx)
+        return np.concatenate([pose, velocity]).astype(np.float32)
+
+    def _state8_delta_from_preprocessed(self, rows: List[List[float]], idx: int) -> np.ndarray:
+        current = self._state8_from_preprocessed(rows, idx)
+        if idx + 1 >= len(rows):
+            return np.zeros_like(current)
+        nxt = self._state8_from_preprocessed(rows, idx + 1)
+        delta = nxt - current
+        delta[3] = (delta[3] + math.pi) % (2 * math.pi) - math.pi
+        delta[7] = (delta[7] + math.pi) % (2 * math.pi) - math.pi
+        return delta.astype(np.float32)
 
     @staticmethod
     def _yaw_delta_deg(yaw: float, yaw0: float) -> float:
@@ -737,6 +883,8 @@ class DummyUAVDataset(Dataset):
             "pixel_values": pixel_values,
             "input_ids":    torch.randint(0, self.vocab_size, (self.max_text_len,)),
             "proprio":      torch.randn(4),
+            "state8":       torch.randn(8),
+            "delta_state8": torch.randn(8),
             "gt_action":    torch.randn(self.chunk_size, 4),
         }
 

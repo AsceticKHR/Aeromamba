@@ -63,7 +63,7 @@ echo "[stage1] projector/resampler alignment"
   --mamba_type "${MAMBA_TYPE}" \
   --vision_type "${VISION_TYPE}" \
   --token_resampler perceiver \
-  --num_visual_queries 32 \
+  --num_visual_queries 64 \
   --resampler_layers 2 \
   --resampler_heads 8 \
   --batch "${STAGE1_BATCH:-12}" \
@@ -84,7 +84,7 @@ echo "[stage2] VLM SFT with LoRA"
   --mamba_type "${MAMBA_TYPE}" \
   --vision_type "${VISION_TYPE}" \
   --token_resampler perceiver \
-  --num_visual_queries 32 \
+  --num_visual_queries 64 \
   --resampler_layers 2 \
   --resampler_heads 8 \
   --batch "${STAGE2_BATCH:-8}" \
@@ -101,7 +101,7 @@ echo "[stage2] VLM SFT with LoRA"
 
 echo "[stage3] UAV-Flow action training"
 "${PYTHON}" training/stage3_action.py \
-  --arch_preset uav_lite_siglip \
+  --arch_preset aeromamba_opt \
   --data_root "${STAGE3_ROOT}" \
   --stage2_ckpt "${SAVE_ROOT}/stage2/best.pth" \
   --mamba_type "${MAMBA_TYPE}" \
@@ -109,18 +109,45 @@ echo "[stage3] UAV-Flow action training"
   --workers "${STAGE3_WORKERS:-24}" \
   --epochs "${STAGE3_EPOCHS:-2}" \
   --lr "${STAGE3_LR:-5e-5}" \
-  --chunk_size "${CHUNK_SIZE:-5}" \
+  --chunk_size "${CHUNK_SIZE:-8}" \
   --pos_scale "${POS_SCALE:-100.0}" \
-  --lambda_smooth "${LAMBDA_SMOOTH:-0.05}" \
-  --lambda_endpoint "${LAMBDA_ENDPOINT:-0.7}" \
-  --lambda_direction "${LAMBDA_DIRECTION:-0.2}" \
+  --lambda_smooth "${LAMBDA_SMOOTH:-0.0}" \
+  --lambda_endpoint "${LAMBDA_ENDPOINT:-2.0}" \
+  --lambda_direction "${LAMBDA_DIRECTION:-0.0}" \
+  --lambda_acc "${LAMBDA_ACC:-0.0}" \
   --max_text_len "${STAGE3_MAX_TEXT_LEN:-64}" \
   --save_dir "${SAVE_ROOT}/stage3" \
   --save_every_steps "${STAGE3_SAVE_EVERY_STEPS:-10000}" \
   --max_val_steps "${STAGE3_MAX_VAL_STEPS:-300}" \
-  --stage3_train_lora \
   --no_amp \
   --log_every 50 \
   2>&1 | tee "${SAVE_ROOT}/stage3.log"
+
+if [[ "${RUN_STAGE3B:-0}" == "1" ]]; then
+  echo "[stage3b] UAV-Flow action refinement with LoRA + acceleration loss"
+  "${PYTHON}" training/stage3_action.py \
+    --arch_preset aeromamba_opt \
+    --data_root "${STAGE3_ROOT}" \
+    --stage2_ckpt "${SAVE_ROOT}/stage3/best.pth" \
+    --mamba_type "${MAMBA_TYPE}" \
+    --batch "${STAGE3B_BATCH:-${STAGE3_BATCH:-24}}" \
+    --workers "${STAGE3B_WORKERS:-${STAGE3_WORKERS:-24}}" \
+    --epochs "${STAGE3B_EPOCHS:-1}" \
+    --lr "${STAGE3B_LR:-2e-5}" \
+    --chunk_size "${CHUNK_SIZE:-8}" \
+    --pos_scale "${POS_SCALE:-100.0}" \
+    --lambda_smooth "${LAMBDA_SMOOTH:-0.0}" \
+    --lambda_endpoint "${LAMBDA_ENDPOINT:-2.0}" \
+    --lambda_direction "${LAMBDA_DIRECTION:-0.0}" \
+    --lambda_acc "${LAMBDA_ACC:-0.5}" \
+    --max_text_len "${STAGE3_MAX_TEXT_LEN:-64}" \
+    --save_dir "${SAVE_ROOT}/stage3b" \
+    --save_every_steps "${STAGE3_SAVE_EVERY_STEPS:-10000}" \
+    --max_val_steps "${STAGE3_MAX_VAL_STEPS:-300}" \
+    --stage3_train_lora \
+    --no_amp \
+    --log_every 50 \
+    2>&1 | tee "${SAVE_ROOT}/stage3b.log"
+fi
 
 echo "[pipeline] complete: ${SAVE_ROOT}"

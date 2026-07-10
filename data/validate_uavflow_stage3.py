@@ -58,6 +58,25 @@ def body_frame_actions(raw_logs: List[List[float]], chunk_size: int) -> np.ndarr
     return np.asarray(actions, dtype=np.float32)
 
 
+def proprio_from_preprocessed(payload: Dict[str, Any]) -> np.ndarray:
+    rows = payload.get("preprocessed_logs") or []
+    values = []
+    for row in rows:
+        if isinstance(row, (list, tuple)) and len(row) >= 6:
+            try:
+                values.append(
+                    [
+                        float(row[0]),
+                        float(row[1]),
+                        float(row[2]),
+                        math.radians(float(row[4])),
+                    ]
+                )
+            except (TypeError, ValueError):
+                continue
+    return np.asarray(values, dtype=np.float32)
+
+
 def validate_trajectory(log_path: Path, chunk_size: int) -> Dict[str, Any]:
     with open(log_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
@@ -72,8 +91,11 @@ def validate_trajectory(log_path: Path, chunk_size: int) -> Dict[str, Any]:
             bad_images += 1
     raw_logs = payload.get("raw_logs") or []
     actions = body_frame_actions(raw_logs, chunk_size)
+    proprio = proprio_from_preprocessed(payload)
     finite = bool(actions.size > 0 and np.isfinite(actions).all())
     nonzero = bool(actions.size > 0 and np.abs(actions[:, :3]).sum() > 1e-6)
+    proprio_finite = bool(proprio.size > 0 and np.isfinite(proprio).all())
+    proprio_nonzero = bool(proprio.size > 0 and np.abs(proprio[:, :3]).sum() > 1e-6)
     return {
         "id": payload.get("id") or log_path.parent.name,
         "length": length,
@@ -82,12 +104,19 @@ def validate_trajectory(log_path: Path, chunk_size: int) -> Dict[str, Any]:
         "has_instruction": bool(payload.get("instruction_unified") or payload.get("instruction")),
         "finite_actions": finite,
         "nonzero_actions": nonzero,
+        "finite_proprio": proprio_finite,
+        "nonzero_proprio": proprio_nonzero,
+        "finite_state": proprio_finite,
+        "nonzero_state": proprio_nonzero,
         "action_abs_mean_cm_rad": actions.mean(axis=0).tolist() if actions.size else [],
+        "proprio_abs_mean_m_rad": np.abs(proprio).mean(axis=0).tolist() if proprio.size else [],
         "ok": length >= chunk_size
         and len(images) == length
         and bad_images == 0
         and finite
-        and nonzero,
+        and nonzero
+        and proprio_finite
+        and proprio_nonzero,
     }
 
 
@@ -107,6 +136,8 @@ def main() -> None:
         "missing_instruction": sum(1 for item in results if not item["has_instruction"]),
         "bad_images": sum(item["bad_images"] for item in results),
         "zero_action_trajectories": sum(1 for item in results if not item["nonzero_actions"]),
+        "zero_proprio_trajectories": sum(1 for item in results if not item["nonzero_proprio"]),
+        "zero_state_trajectories": sum(1 for item in results if not item["nonzero_state"]),
         "examples_bad": [item for item in results if not item["ok"]][:10],
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))

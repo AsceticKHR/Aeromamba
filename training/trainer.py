@@ -137,12 +137,14 @@ class BaseTrainer(ABC):
                 transform=model.vision_encoder.transform,
                 chunk_size=getattr(args, "chunk_size", 5),
                 max_text_len=getattr(args, "max_text_len", 64),
+                aug_flip=getattr(args, "aug_flip", False),
             )
 
         val_frac = getattr(args, "val_frac", 0.1)
         n_val    = max(1, int(len(ds) * val_frac))
         n_train  = len(ds) - n_val
-        train_ds, val_ds = random_split(ds, [n_train, n_val])
+        split_gen = torch.Generator().manual_seed(getattr(args, "split_seed", 42))
+        train_ds, val_ds = random_split(ds, [n_train, n_val], generator=split_gen)
         if getattr(ds, "sequential_loading_preferred", False):
             train_ds.indices.sort()
             val_ds.indices.sort()
@@ -273,6 +275,7 @@ class BaseTrainer(ABC):
             mamba_type=getattr(args, "mamba_type",   "mamba-370m"),
             vision_type=getattr(args, "vision_type",  "dinosiglip_so_384"),
             chunk_size=getattr(args, "chunk_size",   5),
+            proprio_dim=getattr(args, "proprio_dim", 8),
             use_token_pooling=getattr(args, "use_token_pooling", False),
             pool_size=getattr(args, "pool_size", 8),
             token_resampler=getattr(args, "token_resampler", "none"),

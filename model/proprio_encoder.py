@@ -67,7 +67,7 @@ class ProprioEncoder(nn.Module):
 
     def __init__(
         self,
-        proprio_dim:       int   = 4,
+        proprio_dim:       int   = 8,
         mamba_hidden_size: int   = 1024,
         num_freqs:         int   = 8,
         dropout:           float = 0.1,
@@ -99,3 +99,11 @@ class ProprioEncoder(nn.Module):
         embedded = self.sin_emb(proprio)   # [B, in_features]
         token    = self.mlp(embedded)      # [B, D_m]
         return token.unsqueeze(1)          # [B, 1, D_m]
+
+    def forward_pair(
+        self,
+        state: torch.Tensor,
+        delta_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode current state and delta-state as two ordered tokens."""
+        return torch.cat([self.forward(state), self.forward(delta_state)], dim=1)

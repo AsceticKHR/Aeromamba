@@ -15,7 +15,7 @@ Full pipeline:
   [Language]  →  Mamba embed  →  [B, L, D_m]  ──────┐         │
   [UAV state] →  ProprioEncoder → [B, 1, D_m]  ──────┤         │
                                                       └──cat────┘
-                                                 [text | prop | vis]   (causal order)
+                                                 [state | delta | vis | text]   (causal order)
                                                          │
                                                 Mamba-2 backbone
                                                          │
@@ -25,7 +25,7 @@ Full pipeline:
                                                          │
                                                   [B, K, 4]  (Δx, Δy, Δz, Δyaw_rad)
 
-Token sequence order:  [text (L) | proprio (1) | vision (N_vis)]
+Token sequence order:  [state (1) | delta_state (1) | vision (N_vis) | text (L)]
   Rationale: Mamba causal model — language context first, then state,
   then vision.  Last token's hidden state aggregates all context.
 
@@ -204,15 +204,15 @@ class AeroMambaVLA(nn.Module):
 
     def __init__(
         self,
-        mamba_type:    str  = "mamba-370m",
-        vision_type:   str  = "dinosiglip_so_384",
+        mamba_type:    str  = "mamba-2-370m",
+        vision_type:   str  = "siglip2_base_384",
         chunk_size:    int  = 5,
-        proprio_dim:   int  = 4,
+        proprio_dim:   int  = 8,
         freeze_vision: bool = True,
         use_token_pooling: bool = False,
         pool_size:     int  = 8,
-        token_resampler: str = "none",
-        num_visual_queries: int = 32,
+        token_resampler: str = "perceiver",
+        num_visual_queries: int = 64,
         resampler_layers: int = 2,
         resampler_heads: int = 8,
         action_head_type: str = "mlp",
@@ -415,6 +415,49 @@ class AeroMambaVLA(nn.Module):
 
         return vis_patches  # [B, N_vis, D_v]
 
+    def _prepare_state_inputs(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        state: Optional[torch.Tensor] = None,
+        delta_state: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return padded/truncated 8D state and delta-state tensors."""
+        state_dim = self.proprio_encoder.proprio_dim
+        if state is None:
+            state = proprio
+        if state is None:
+            state = torch.zeros(batch_size, state_dim, device=device, dtype=dtype)
+        state = state.to(device=device, dtype=dtype)
+        if state.size(-1) < state_dim:
+            state = torch.cat(
+                [state, state.new_zeros(*state.shape[:-1], state_dim - state.size(-1))],
+                dim=-1,
+            )
+        elif state.size(-1) > state_dim:
+            state = state[..., :state_dim]
+
+        if delta_state is None:
+            delta_state = torch.zeros_like(state)
+        else:
+            delta_state = delta_state.to(device=device, dtype=dtype)
+            if delta_state.size(-1) < state_dim:
+                delta_state = torch.cat(
+                    [
+                        delta_state,
+                        delta_state.new_zeros(
+                            *delta_state.shape[:-1],
+                            state_dim - delta_state.size(-1),
+                        ),
+                    ],
+                    dim=-1,
+                )
+            elif delta_state.size(-1) > state_dim:
+                delta_state = delta_state[..., :state_dim]
+        return state, delta_state
+
     # ─────────────────────────────────────────────────────────────────────────
     # Forward
     # ─────────────────────────────────────────────────────────────────────────
@@ -423,13 +466,16 @@ class AeroMambaVLA(nn.Module):
         self,
         pixel_values:  Union[torch.Tensor, Dict[str, torch.Tensor]],
         input_ids:     torch.Tensor,                    # [B, L]
-        proprio:       Optional[torch.Tensor] = None,   # [B, 4]
+        proprio:       Optional[torch.Tensor] = None,   # legacy [B, 4] or [B, D]
+        state:         Optional[torch.Tensor] = None,   # [B, 8]
+        delta_state:   Optional[torch.Tensor] = None,   # [B, 8]
         gt_action:     Optional[torch.Tensor] = None,   # [B, K, 4]  train only
         cache_params=None,
         return_loss:   bool  = False,
-        lambda_smooth: float = 0.1,
-        lambda_endpoint: float = 0.5,
-        lambda_direction: float = 0.2,
+        lambda_smooth: float = 0.0,
+        lambda_endpoint: float = 2.0,
+        lambda_direction: float = 0.0,
+        lambda_acc: float = 0.0,
     ) -> dict:
         """
         Multimodal forward pass.
@@ -439,8 +485,8 @@ class AeroMambaVLA(nn.Module):
                                                   "siglip": [B,3,H,W]}
                        (produced automatically by DinoSigLIPTransform)
 
-        Token sequence: [text (L) | proprio (1) | vision (N_vis)]
-        Global token  : hidden[:, -1, :]  — last vision token accumulates all.
+        Token sequence: [state (1) | delta_state (1) | vision (N_vis) | text (L)]
+        Global token  : last non-padding language token.
 
         Returns dict with:
             'action'       : [B, K, 4]  predicted action chunk
@@ -453,54 +499,42 @@ class AeroMambaVLA(nn.Module):
             else pixel_values.size(0)
         )
 
-        # ── 1. Text embeddings ───────────────────────────────────────────────
+        # 1. Text embeddings
         text_embs = self._embed_text(input_ids)           # [B, L, D_m]
 
-        # ── 2. Proprioception token ──────────────────────────────────────────
-        if proprio is None:
-            proprio = torch.zeros(
-                B, self.proprio_encoder.proprio_dim,
-                device=input_ids.device,
-                dtype=text_embs.dtype,
-            )
-        prop_token = self.proprio_encoder(proprio)         # [B, 1, D_m]
+        # 2. State tokens: [s, delta_s]
+        state, delta_state = self._prepare_state_inputs(
+            B,
+            input_ids.device,
+            text_embs.dtype,
+            state=state,
+            delta_state=delta_state,
+            proprio=proprio,
+        )
+        state_tokens = self.proprio_encoder.forward_pair(state, delta_state)
 
-        # ── 3. Vision tokens ─────────────────────────────────────────────────
-        vis_patches = self._encode_vision(pixel_values)   # [B, N_vis, D_v]
-        vis_tokens  = self.projector(vis_patches)          # [B, N_vis, D_m]
-        vis_tokens  = self.token_resampler(vis_tokens)     # [B, N_resampled, D_m]
+        # 3. Vision tokens
+        vis_patches = self._encode_vision(pixel_values)
+        vis_tokens = self.projector(vis_patches)
+        vis_tokens = self.token_resampler(vis_tokens)
 
-        # ── 4. Concatenate: [text | proprio | vision] ────────────────────────
-        # Causal order: language context → flight state → visual observation.
-        # Mamba retains earlier tokens more strongly; last visual token
-        # accumulates the full multimodal context.
-        inputs_embeds = torch.cat(
-            [text_embs, prop_token, vis_tokens], dim=1
-        )  # [B, L + 1 + N_vis, D_m]
+        # 4. Unified AeroMamba-Opt order: [state | delta_state | vision | text]
+        inputs_embeds = torch.cat([state_tokens, vis_tokens, text_embs], dim=1)
 
-        # ── 5. Mamba backbone ─────────────────────────────────────────────────
+        # 5. Mamba backbone
         hidden = self._run_mamba(inputs_embeds, cache_params)
-        # [B, L + 1 + N_vis, D_m]
 
-        # ── 6. Global token: last hidden state (RoboMamba convention) ─────────
+        # 6. Action context: last non-padding language token
         pad_id = getattr(self.tokenizer, "pad_token_id", 0)
         text_mask = (input_ids != pad_id).to(text_embs.dtype)
-        text_denom = text_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        text_summary = (
-            hidden[:, : input_ids.size(1), :] * text_mask.unsqueeze(-1)
-        ).sum(dim=1) / text_denom
-        prop_summary = hidden[:, input_ids.size(1), :]
-        vision_summary = hidden[:, input_ids.size(1) + 1 :, :].mean(dim=1)
-        global_token = hidden[:, -1, :]
-        fused_context = self.action_context_fuser(
-            torch.cat([global_token, text_summary, prop_summary, vision_summary], dim=-1)
-        )
-        global_token = global_token + fused_context
+        text_lengths = text_mask.sum(dim=1).long().clamp_min(1) - 1
+        prefix_len = state_tokens.size(1) + vis_tokens.size(1)
+        gather_idx = (prefix_len + text_lengths).view(B, 1, 1).expand(-1, 1, hidden.size(-1))
+        global_token = hidden.gather(dim=1, index=gather_idx).squeeze(1)
 
-        # ── 7. Action chunking head ───────────────────────────────────────────
-        pred = self.action_head(global_token, proprio=proprio)   # {"action": [B, K, 4]}
+        # 7. Action chunking head
+        pred = self.action_head(global_token, proprio=state)
 
-        # ── 8. Loss (training only) ───────────────────────────────────────────
         if return_loss and gt_action is not None:
             loss, detail = aero_action_loss(
                 pred,
@@ -508,43 +542,44 @@ class AeroMambaVLA(nn.Module):
                 lambda_smooth=lambda_smooth,
                 lambda_endpoint=lambda_endpoint,
                 lambda_direction=lambda_direction,
+                lambda_acc=lambda_acc,
             )
-            pred["loss"]        = loss
+            pred["loss"] = loss
             pred["loss_detail"] = detail
 
         return pred
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Inference helper
-    # ─────────────────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
     def predict_step(
         self,
         pixel_values: Union[torch.Tensor, Dict[str, torch.Tensor]],
-        input_ids:    torch.Tensor,
-        proprio:      Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        state: Optional[torch.Tensor] = None,
+        delta_state: Optional[torch.Tensor] = None,
         cache_params=None,
     ) -> dict:
         """Single-step inference. Returns {"action": [B, K, 4]}."""
-        self.eval()
-        return self.forward(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            proprio=proprio,
-            cache_params=cache_params,
-            return_loss=False,
-        )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # LoRA
-    # ─────────────────────────────────────────────────────────────────────────
+        was_training = self.training
+        try:
+            self.eval()
+            return self.forward(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                proprio=proprio,
+                state=state,
+                delta_state=delta_state,
+                cache_params=cache_params,
+                return_loss=False,
+            )
+        finally:
+            self.train(was_training)
 
     def apply_lora(
         self,
-        r:              int       = 16,
-        lora_alpha:     int       = 32,
-        lora_dropout:   float     = 0.05,
+        r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
         target_modules: list[str] = None,
     ) -> "AeroMambaVLA":
         """Wrap Mamba backbone with LoRA adapters (requires `peft`)."""
@@ -565,16 +600,8 @@ class AeroMambaVLA(nn.Module):
         self.mamba = get_peft_model(self.mamba, cfg)
         return self
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Stage configuration
-    # ─────────────────────────────────────────────────────────────────────────
-
     def configure_stage1(self) -> None:
-        """
-        Stage 1 — Projector alignment (InfoNCE).
-        Trainable : MLPProjector only.
-        Frozen    : VisionEncoder(s), Mamba, ProprioEncoder, ActionHead.
-        """
+        """Stage 1: train projector and optional token resampler only."""
         for p in self.parameters():
             p.requires_grad = False
         for p in self.projector.parameters():
@@ -584,13 +611,9 @@ class AeroMambaVLA(nn.Module):
                 p.requires_grad = True
 
     def configure_stage2(self, lora_r: int = 16, lora_alpha: int = 32) -> None:
-        """
-        Stage 2 — VLM instruction fine-tuning.
-        Trainable : MLPProjector + Mamba-LoRA adapters.
-        Frozen    : VisionEncoder(s), ProprioEncoder, ActionHead.
-        """
-        self.configure_stage1()                         # freeze everything first
-        self.apply_lora(r=lora_r, lora_alpha=lora_alpha)  # LoRA params auto-trainable
+        """Stage 2: projector/resampler plus Mamba LoRA adapters."""
+        self.configure_stage1()
+        self.apply_lora(r=lora_r, lora_alpha=lora_alpha)
 
     def configure_stage3(self, train_lora: bool = False) -> None:
         """
@@ -608,8 +631,6 @@ class AeroMambaVLA(nn.Module):
         if not isinstance(self.token_resampler, nn.Identity):
             for p in self.token_resampler.parameters():
                 p.requires_grad = True
-        for p in self.action_context_fuser.parameters():
-            p.requires_grad = True
         if train_lora:
             for name, p in self.mamba.named_parameters():
                 if "lora_" in name:

@@ -284,8 +284,6 @@ Training sanity:
 Useful design and debugging notes are in:
 
 - `docs/UAVFLOW_STAGE3_DATA_PREP.md`
-- `docs/aeromamba_improved_architecture_report.md`
-- `docs/aeromamba_stage3_action_collapse_diagnosis.md`
 - `docs/aeromamba_uav_flow_eval_framework.md`
 
 ## Git Hygiene

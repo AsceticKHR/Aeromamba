@@ -2,7 +2,7 @@
 
 data:
   data_root:   ""                   # Set to UAV-Flow dataset root. Empty = dummy data.
-  chunk_size:  5                    # Must match model.chunk_size
+  chunk_size:  8                    # Must match model.chunk_size (AeroMamba-Opt)
   max_text_len: 64
   pos_scale:   100.0                # cm → normalised (divide positions by this)
   val_frac:    0.1
@@ -29,7 +29,9 @@ stage3:                             # ActionHead + ProprioEncoder training
   epochs:        20
   batch:         8
   lr:            5.0e-4
-  lambda_smooth: 0.1
+  lambda_smooth: 0.0
+  lambda_endpoint: 2.0
+  lambda_acc: 0.0
   workers:  4
   save_dir: "./checkpoints/stage3"
 

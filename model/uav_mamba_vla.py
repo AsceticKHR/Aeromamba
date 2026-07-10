@@ -12,22 +12,22 @@ Full pipeline:
       │                                                         │
       │                                               MLPProjector [B, 729, D_m]
       │                                                         │
-  [Language]  →  Mamba embed  →  [B, L, D_m]  ──────┐         │
-  [UAV state] →  ProprioEncoder → [B, 1, D_m]  ──────┤         │
-                                                      └──cat────┘
-                                                 [state | delta | vis | text]   (causal order)
+  [UAV state] →  ProprioEncoder → [B, 2, D_m]  ─────┐         │
+  [FPV image] →  projector/resampler → [B, N, D_m] ─┤         │
+  [Language]  →  Mamba embed  →  [B, L, D_m]  ──────┴──cat────┘
+                                                 [state | delta | vis | text]
                                                          │
                                                 Mamba-2 backbone
                                                          │
-                                                   h[:, -1, :]   (last token)
+                              last valid language token hidden state
                                                          │
                                                UAVActionHead MLP
                                                          │
                                                   [B, K, 4]  (Δx, Δy, Δz, Δyaw_rad)
 
 Token sequence order:  [state (1) | delta_state (1) | vision (N_vis) | text (L)]
-  Rationale: Mamba causal model — language context first, then state,
-  then vision.  Last token's hidden state aggregates all context.
+  Stage 1/2 feed zero state tokens; Stage 3 uses real 8D state + delta_state.
+  Action pooling uses the last non-padding language token, not hidden[:, -1].
 
 Vision choices:
   Single  : 'siglip_l_384', 'siglip_so_384', 'dinov2_l', etc.
@@ -334,13 +334,6 @@ class AeroMambaVLA(nn.Module):
                 f"Unknown action_head_type '{action_head_type}'. "
                 "Choose from: 'mlp', 'dynamics'."
             )
-
-        self.action_context_fuser = nn.Sequential(
-            nn.LayerNorm(D_m * 4),
-            nn.Linear(D_m * 4, D_m),
-            nn.SiLU(),
-            nn.Linear(D_m, D_m),
-        )
 
         # Store key dimensions
         self.D_m = D_m

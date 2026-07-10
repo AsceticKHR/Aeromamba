@@ -192,6 +192,7 @@ checkpoints/<RUN>.pid
 
 ```bash
 python training/stage1_align.py \
+  --arch_preset aeromamba_opt \
   --data_root /root/autodl-tmp/Aeromamba/data/llava_pretrain \
   --json_name blip_laion_cc_sbu_558k.json \
   --mamba_type mamba-2-370m \
@@ -214,6 +215,7 @@ Trainable modules: `projector`, `token_resampler`.
 
 ```bash
 python training/stage2_vlm.py \
+  --arch_preset aeromamba_opt \
   --data_root /root/autodl-tmp/Aeromamba/data \
   --json_name stage2_mixed_data.json \
   --stage1_ckpt checkpoints/full_stage/stage1/best.pth \
@@ -270,9 +272,12 @@ python -m py_compile \
   data/validate_uavflow_stage3.py \
   model/action_head.py \
   model/uav_mamba_vla.py \
+  training/arch_presets.py \
   training/stage1_align.py \
   training/stage2_vlm.py \
   training/stage3_action.py
+
+python scripts/test_aeromamba_opt_contract.py
 ```
 
 Training sanity:

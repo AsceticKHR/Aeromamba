@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from model.uav_mamba_vla import AeroMambaVLA
 from training.trainer    import BaseTrainer
+from training.arch_presets import add_arch_preset_arg, apply_arch_preset
 
 
 class Stage1Trainer(BaseTrainer):
@@ -145,6 +146,7 @@ class Stage1Trainer(BaseTrainer):
 
 def get_args():
     p = argparse.ArgumentParser(description="AeroMamba Stage 1: CLM Projector Alignment")
+    add_arch_preset_arg(p)
     p.add_argument("--dummy",         action="store_true",     help="Keep for compatibility, not active")
     p.add_argument("--data_root",     default="./data/llava_subset", help="Path to LLaVA subset folder")
     p.add_argument("--json_name",     default="llava_subset.json")
@@ -169,7 +171,8 @@ def get_args():
     p.add_argument("--max_val_steps", type=int,   default=100)
     p.add_argument("--no_amp",        action="store_true")
     p.add_argument("--save_every_steps", type=int, default=None)
-    return p.parse_args()
+    args = p.parse_args()
+    return apply_arch_preset(args, "stage1")
 
 
 if __name__ == "__main__":

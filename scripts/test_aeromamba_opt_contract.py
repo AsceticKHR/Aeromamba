@@ -77,6 +77,12 @@ def test_training_sources_use_opt_order() -> None:
     model_text = (ROOT / "model/uav_mamba_vla.py").read_text(encoding="utf-8")
     assert "torch.cat([state_tokens, vis_tokens, text_embs], dim=1)" in model_text
     assert "last non-padding language token" in model_text
+    assert "action_context_fuser" not in model_text
+
+
+def test_legacy_dataset_rejects_missing_instruction() -> None:
+    dataset_text = (ROOT / "data/dataset.py").read_text(encoding="utf-8")
+    assert "refusing fixed fallback" in dataset_text
 
 
 if __name__ == "__main__":
@@ -85,4 +91,5 @@ if __name__ == "__main__":
     test_dummy_dataset_exposes_opt_state()
     test_action_loss_s3a_s3b_contract()
     test_training_sources_use_opt_order()
+    test_legacy_dataset_rejects_missing_instruction()
     print("AeroMamba-Opt contract tests passed.")

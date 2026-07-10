@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 from model.uav_mamba_vla import AeroMambaVLA
 from training.trainer    import BaseTrainer
+from training.arch_presets import add_arch_preset_arg, apply_arch_preset
 
 
 def _to_device(value, device):
@@ -87,7 +88,7 @@ class Stage3Trainer(BaseTrainer):
             delta_state=delta_state,
             gt_action=gt_action,
             return_loss=True,
-            lambda_smooth=getattr(self.args, "lambda_smooth", 0.1),
+            lambda_smooth=getattr(self.args, "lambda_smooth", 0.0),
             lambda_endpoint=getattr(self.args, "lambda_endpoint", 2.0),
             lambda_direction=getattr(self.args, "lambda_direction", 0.0),
             lambda_acc=getattr(self.args, "lambda_acc", 0.0),
@@ -101,23 +102,7 @@ class Stage3Trainer(BaseTrainer):
 
 def get_args():
     p = argparse.ArgumentParser(description="AeroMamba Stage 3: Action Head Training")
-    p.add_argument(
-        "--arch_preset",
-        default="none",
-        choices=[
-            "none",
-            "uav_lite_compatible",
-            "uav_lite_siglip",
-            "aeromamba_opt",
-            "aeromamba_opt_fast",
-        ],
-        help=(
-            "Architecture preset. 'uav_lite_compatible' keeps the existing "
-            "DinoSigLIP Stage-2 projector but adds Perceiver resampling and "
-            "a dynamics head. 'uav_lite_siglip' switches to a SigLIP-only "
-            "lightweight vision stack for a new Stage1/2/3 run."
-        ),
-    )
+    add_arch_preset_arg(p)
     p.add_argument("--dummy",          action="store_true")
     p.add_argument("--data_root",      default="")
     p.add_argument("--hf_dataset",     default="", help="HuggingFace dataset name, e.g. wangxiangyu0814/UAV-Flow")
@@ -161,63 +146,7 @@ def get_args():
     p.add_argument("--no_amp",         action="store_true", help="Disable CUDA autocast/GradScaler for numerical stability.")
     p.add_argument("--save_every_steps", type=int, default=None, help="Save latest.pth every N training steps.")
     args = p.parse_args()
-
-    if args.arch_preset == "uav_lite_compatible":
-        args.vision_type = "dinosiglip_so_384"
-        args.token_resampler = "perceiver"
-        args.num_visual_queries = 32
-        args.resampler_layers = 2
-        args.resampler_heads = 8
-        args.action_head_type = "dynamics"
-        args.stage3_train_lora = True
-        args.no_amp = True
-        if args.lr == 5e-4:
-            args.lr = 5e-5
-    elif args.arch_preset == "uav_lite_siglip":
-        args.vision_type = "siglip2_base_384"
-        if args.mamba_type == "mamba-130m":
-            args.mamba_type = "mamba-2-370m"
-        args.token_resampler = "perceiver"
-        args.num_visual_queries = 32
-        args.resampler_layers = 2
-        args.resampler_heads = 8
-        args.action_head_type = "dynamics"
-        args.stage3_train_lora = True
-        args.no_amp = True
-        if args.lr == 5e-4:
-            args.lr = 5e-5
-    elif args.arch_preset == "aeromamba_opt":
-        args.vision_type = "siglip2_base_384"
-        if args.mamba_type == "mamba-130m":
-            args.mamba_type = "mamba-2-370m"
-        args.token_resampler = "perceiver"
-        args.num_visual_queries = 64
-        args.resampler_layers = 2
-        args.resampler_heads = 8
-        args.action_head_type = "mlp"
-        args.proprio_dim = 8
-        if args.chunk_size == 5:
-            args.chunk_size = 8
-        args.no_amp = True
-        if args.lr == 5e-4:
-            args.lr = 5e-5
-    elif args.arch_preset == "aeromamba_opt_fast":
-        args.vision_type = "siglip2_base_p32_256"
-        if args.mamba_type == "mamba-130m":
-            args.mamba_type = "mamba-2-370m"
-        args.token_resampler = "perceiver"
-        args.num_visual_queries = 32
-        args.resampler_layers = 2
-        args.resampler_heads = 8
-        args.action_head_type = "mlp"
-        args.proprio_dim = 8
-        if args.chunk_size == 5:
-            args.chunk_size = 8
-        args.no_amp = True
-        if args.lr == 5e-4:
-            args.lr = 5e-5
-
-    return args
+    return apply_arch_preset(args, "stage3")
 
 
 if __name__ == "__main__":

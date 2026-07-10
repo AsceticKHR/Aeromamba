@@ -3,20 +3,26 @@
 
 model:
   # ── Backbone ────────────────────────────────────────────────────────────
-  mamba_type:  "mamba-370m"         # Options: mamba-130m / 370m / 790m / 1.4b / 2.8b
-  vision_type: "dinosiglip_so_384"  # Options: dinosiglip_so_384 / siglip_l_384 / siglip_b_224 / clip_l_336
+  mamba_type:  "mamba-2-370m"       # Options: mamba-130m / 370m / 790m / 1.4b / 2.8b / mamba-2-370m
+  vision_type: "siglip2_base_384"   # AeroMamba-Opt default vision encoder
 
   # ── MLP Projector ────────────────────────────────────────────────────────
   # LLaVA-1.5 style: Linear(D_v, D_m*2) → GELU → Linear(D_m*2, D_m) → LN
-  # No token compression — all N_vis patches are passed to Mamba.
+
+  # ── Token compressor ─────────────────────────────────────────────────────
+  token_resampler:     "perceiver"
+  num_visual_queries:  64
+  resampler_layers:    2
+  resampler_heads:     8
 
   # ── Action Head ─────────────────────────────────────────────────────────
-  chunk_size:  5                    # K future waypoints per prediction
+  chunk_size:  8                    # K future waypoints per prediction (AeroMamba-Opt)
   action_dim:  4                    # [Δx, Δy, Δz, Δyaw_rad]
+  action_head_type: "mlp"
 
   # ── Proprioception ──────────────────────────────────────────────────────
-  proprio_dim:       4              # [Δx, Δy, Δz, Δyaw]
-  proprio_num_freqs: 8              # Sinusoidal embedding frequency bands
+  proprio_dim:       8              # [x, y, z, yaw, vx, vy, vz, yaw_rate]
+  proprio_num_freqs: 8            # Sinusoidal embedding frequency bands
 
   # ── LoRA (Stage 2) ──────────────────────────────────────────────────────
   lora_r:       16
@@ -28,5 +34,8 @@ model:
     - "x_proj"
     - "dt_proj"
 
-  # ── Loss weights ────────────────────────────────────────────────────────
-  lambda_smooth: 0.1               # Smoothness regularisation weight
+  # ── Loss weights (Stage 3) ───────────────────────────────────────────────
+  lambda_smooth:    0.0
+  lambda_endpoint:  2.0
+  lambda_direction: 0.0
+  lambda_acc:       0.0

@@ -196,8 +196,13 @@ class UAVFlowDataset(Dataset):
         pixel_values = self.transform(img)
 
         # ── Instruction ───────────────────────────────────────────────────────
-        instruction = anchor.get("instruction", "")
-        input_ids   = self._tokenize(instruction)
+        instruction = anchor.get("instruction") or anchor.get("instruction_unified")
+        if not instruction:
+            raise ValueError(
+                f"UAV-Flow sample at traj={traj_idx} step={step_idx} is missing "
+                "instruction; refusing fixed fallback."
+            )
+        input_ids = self._tokenize(instruction)
 
         # ── Proprioception ────────────────────────────────────────────────────
         state  = anchor.get("state", [[0, 0, 0], [0, 0, 0]])

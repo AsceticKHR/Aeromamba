@@ -64,7 +64,43 @@ def test_action_loss_s3a_s3b_contract() -> None:
     )
     assert torch.isfinite(loss_a)
     assert torch.isfinite(loss_b)
-    assert "acc" in detail_a and "acc" in detail_b
+    assert "acc" in detail_b
+    assert "pos_err_m" in detail_a and "yaw_err_deg" in detail_a
+
+
+def test_action_zscore_normalization_contract() -> None:
+    from model.action_head import UAVActionHead
+
+    head = UAVActionHead(mamba_hidden_size=32, chunk_size=8, action_dim=4)
+    # Default buffers are identity
+    assert not head.has_normalization()
+    gt = torch.randn(2, 8, 4) * 0.1
+    assert torch.allclose(head.normalize(gt), gt)
+
+    mean = torch.randn(8, 4) * 0.05
+    std = torch.rand(8, 4) * 0.1 + 0.01
+    head.set_normalization(mean, std)
+    assert head.has_normalization()
+    # Roundtrip: denormalize(normalize(x)) == x
+    assert torch.allclose(head.denormalize(head.normalize(gt)), gt, atol=1e-5)
+
+    # Loss in z-space is finite and reports physical diagnostics
+    pred = {"action": torch.zeros(2, 8, 4)}
+    loss, detail = aero_action_loss(pred, gt, head=head)
+    assert torch.isfinite(loss)
+    assert "pos_err_m" in detail and "end_pos_err_m" in detail
+
+    # Buffers persist through state_dict (checkpoint round-trip)
+    head2 = UAVActionHead(mamba_hidden_size=32, chunk_size=8, action_dim=4)
+    head2.load_state_dict(head.state_dict())
+    assert torch.allclose(head2.action_mean, head.action_mean)
+    assert torch.allclose(head2.action_std, head.action_std)
+
+    # Zero-init output layer ⇒ z-space output 0 ⇒ physical output = dataset mean
+    tok = torch.randn(2, 32)
+    out = head(tok)["action"]
+    phys = head.denormalize(out)
+    assert torch.allclose(phys, mean.unsqueeze(0).expand(2, -1, -1), atol=1e-5)
 
 
 def test_training_sources_use_opt_order() -> None:
@@ -90,6 +126,7 @@ if __name__ == "__main__":
     test_proprio_encoder_pair_contract()
     test_dummy_dataset_exposes_opt_state()
     test_action_loss_s3a_s3b_contract()
+    test_action_zscore_normalization_contract()
     test_training_sources_use_opt_order()
     test_legacy_dataset_rejects_missing_instruction()
     print("AeroMamba-Opt contract tests passed.")

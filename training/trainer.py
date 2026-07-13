@@ -137,7 +137,11 @@ class BaseTrainer(ABC):
                 transform=model.vision_encoder.transform,
                 chunk_size=getattr(args, "chunk_size", 5),
                 max_text_len=getattr(args, "max_text_len", 64),
+                pos_scale=getattr(args, "pos_scale", 100.0),
                 aug_flip=getattr(args, "aug_flip", False),
+                aug_vision=getattr(args, "aug_vision", False),
+                oversample_turn_factor=getattr(args, "oversample_turn_factor", 1),
+                oversample_turn_deg=getattr(args, "oversample_turn_deg", 10.0),
             )
 
         val_frac = getattr(args, "val_frac", 0.1)
@@ -306,11 +310,13 @@ class BaseTrainer(ABC):
             train_ds, batch_size=batch, shuffle=shuffle_train,
             num_workers=workers, pin_memory=pin, drop_last=True,
             collate_fn=collate_fn, persistent_workers=(workers > 0),
+            prefetch_factor=4 if workers > 0 else None,
         )
         val_loader = DataLoader(
             val_ds, batch_size=batch, shuffle=False,
             num_workers=workers, pin_memory=pin,
             collate_fn=collate_fn, persistent_workers=(workers > 0),
+            prefetch_factor=4 if workers > 0 else None,
         )
 
         # ── Optimizer & scheduler ──────────────────────────────────────────────
@@ -339,14 +345,26 @@ class BaseTrainer(ABC):
 
         # ── Optional: resume from checkpoint ──────────────────────────────────
         resume = getattr(args, "resume", None)
+        resume_model_only = getattr(args, "resume_model_only", False)
         if resume and Path(resume).exists():
             ckpt = torch.load(resume, map_location=self.device)
-            model.load_state_dict(ckpt["model_state"])
-            optimizer.load_state_dict(ckpt["optim_state"])
-            start_epoch = ckpt["epoch"] + 1
-            best_val    = ckpt["best_val"]
-            print(f"[Trainer] Resumed from epoch {ckpt['epoch']}  "
-                  f"(best_val={best_val:.4f})")
+            missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+            if missing or unexpected:
+                print(f"[Trainer] Resume: {len(missing)} missing / "
+                      f"{len(unexpected)} unexpected keys (non-strict load)")
+            if resume_model_only:
+                start_epoch = 1
+                best_val = float("inf")
+                print(
+                    f"[Trainer] Loaded model weights only from {resume} "
+                    f"(ckpt epoch={ckpt.get('epoch', '?')}); optimizer reset for new trainable params."
+                )
+            else:
+                optimizer.load_state_dict(ckpt["optim_state"])
+                start_epoch = ckpt["epoch"] + 1
+                best_val = ckpt["best_val"]
+                print(f"[Trainer] Resumed from epoch {ckpt['epoch']}  "
+                      f"(best_val={best_val:.4f})")
 
         # ── Training loop ──────────────────────────────────────────────────────
         for epoch in range(start_epoch, epochs + 1):

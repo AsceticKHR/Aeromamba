@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -62,6 +63,40 @@ def normalize_action(
     dx, dy, dz = action[0] / pos_scale, action[1] / pos_scale, action[2] / pos_scale
     dyaw_rad = math.radians(action[3]) if len(action) > 3 else 0.0
     return np.array([dx, dy, dz, dyaw_rad], dtype=np.float32)
+
+
+# Horizontal-flip augmentation mirrors the image and negates y/yaw, so any
+# left/right (or rotation-direction) wording in the instruction must be
+# swapped too — otherwise the model is trained on contradictory
+# text/action pairs (e.g. "pass from the left" paired with a right-side
+# trajectory), which directly undermines the turn-oversampling strategy.
+_LEFT_RIGHT_PATTERN = re.compile(
+    r"\b(left|right|clockwise|counter-clockwise|counterclockwise)\b",
+    re.IGNORECASE,
+)
+_LEFT_RIGHT_SWAP = {
+    "left": "right",
+    "right": "left",
+    "clockwise": "counterclockwise",
+    "counterclockwise": "clockwise",
+    "counter-clockwise": "clockwise",
+}
+
+
+def mirror_instruction_lr(text: str) -> str:
+    """Swap left/right (and rotation-direction) words to stay consistent
+    with a horizontally-flipped image + negated y/yaw action target."""
+
+    def _replace(match: "re.Match[str]") -> str:
+        word = match.group(0)
+        replacement = _LEFT_RIGHT_SWAP.get(word.lower(), word)
+        if word.isupper():
+            return replacement.upper()
+        if word[:1].isupper():
+            return replacement.capitalize()
+        return replacement
+
+    return _LEFT_RIGHT_PATTERN.sub(_replace, text)
 
 
 def parse_proprio(state: List[List[float]]) -> np.ndarray:
@@ -114,6 +149,17 @@ class UAVFlowDataset(Dataset):
         split:          'train' | 'val' | 'test'
         pos_scale:      Divisor for position normalisation (cm → ~meters).
         aug_flip:       Random horizontal flip augmentation (train only).
+        aug_vision:     Appearance augmentation (color jitter / grayscale /
+                        blur) to shrink the real-photo → Unreal-render domain
+                        gap. Label-free (no geometric change).
+        oversample_turn_factor:
+                        Replicate turn-heavy chunk samples N× in the index.
+                        UAV-Flow is dominated by straight forward flight;
+                        without oversampling the model regresses to "fly
+                        forward" and ignores turn commands.
+        oversample_turn_deg:
+                        A chunk counts as turn-heavy when the max cumulative
+                        |Δyaw| from the anchor exceeds this many degrees.
         json_extension: File extension for trajectory files.
     """
 
@@ -127,6 +173,9 @@ class UAVFlowDataset(Dataset):
         split:         str   = "train",
         pos_scale:     float = 100.0,
         aug_flip:      bool  = True,
+        aug_vision:    bool  = False,
+        oversample_turn_factor: int = 1,
+        oversample_turn_deg: float = 10.0,
         json_extension:str   = ".json",
     ):
         super().__init__()
@@ -138,6 +187,16 @@ class UAVFlowDataset(Dataset):
         self.pos_scale    = pos_scale
         self.aug_flip     = aug_flip and (split == "train")
         self.split        = split
+
+        self.aug_vision = aug_vision and (split == "train")
+        self.vision_aug = None
+        if self.aug_vision:
+            from torchvision import transforms as T
+            self.vision_aug = T.Compose([
+                T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+                T.RandomGrayscale(p=0.05),
+                T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))], p=0.2),
+            ])
 
         # Collect trajectory files. Supports both the legacy AeroMamba list
         # format and the official UAV-Flow folder format:
@@ -160,15 +219,43 @@ class UAVFlowDataset(Dataset):
         # Build flat index: (traj_file_idx, step_idx) for each valid chunk
         self.index: List[Tuple[int, int]] = []
         self.trajectories: List[List[Dict[str, Any]]] = []
+        oversample = max(1, int(oversample_turn_factor)) if split == "train" else 1
+        n_turn_samples = 0
 
         for traj_idx, traj_path in enumerate(self.traj_files):
             traj = self._load_trajectory(traj_path)
             if not isinstance(traj, list) or len(traj) < chunk_size:
                 continue
             self.trajectories.append(traj)
+            t = len(self.trajectories) - 1
+            yaws = None
+            if oversample > 1:
+                yaws = [
+                    float(step.get("state", [[0, 0, 0], [0, 0, 0]])[1][1])
+                    for step in traj
+                ]
             # Sliding window: every step where a full K-chunk is available
             for step_idx in range(len(traj) - chunk_size + 1):
-                self.index.append((len(self.trajectories) - 1, step_idx))
+                self.index.append((t, step_idx))
+                if yaws is not None:
+                    yaw0 = yaws[step_idx]
+                    max_dyaw = max(
+                        abs((yaws[step_idx + k] - yaw0 + 180.0) % 360.0 - 180.0)
+                        for k in range(chunk_size)
+                    )
+                    if max_dyaw >= oversample_turn_deg:
+                        self.index.extend([(t, step_idx)] * (oversample - 1))
+                        n_turn_samples += 1
+
+        if oversample > 1:
+            base = len(self.index) - n_turn_samples * (oversample - 1)
+            eff = n_turn_samples * oversample / max(len(self.index), 1)
+            print(
+                f"[UAVFlowDataset] Turn oversampling x{oversample}: "
+                f"{n_turn_samples}/{base} turn chunks (>{oversample_turn_deg}deg) "
+                f"-> effective turn fraction {100.0 * eff:.1f}% "
+                f"({len(self.index)} total samples)"
+            )
 
         if not self.index:
             raise ValueError(
@@ -188,6 +275,8 @@ class UAVFlowDataset(Dataset):
 
         # ── Image ────────────────────────────────────────────────────────────
         img = self._load_image(anchor, traj_idx, step_idx)
+        if self.vision_aug is not None:
+            img = self.vision_aug(img)
         do_flip = self.aug_flip and random.random() < 0.5
         if do_flip:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -202,6 +291,8 @@ class UAVFlowDataset(Dataset):
                 f"UAV-Flow sample at traj={traj_idx} step={step_idx} is missing "
                 "instruction; refusing fixed fallback."
             )
+        if do_flip:
+            instruction = mirror_instruction_lr(instruction)
         input_ids = self._tokenize(instruction)
 
         # ── Proprioception ────────────────────────────────────────────────────
@@ -565,6 +656,8 @@ class UAVFlowHFDataset(Dataset):
         )
         if not instruction:
             raise ValueError("UAV-Flow sample is missing instruction; refusing fixed fallback.")
+        if do_flip:
+            instruction = mirror_instruction_lr(instruction)
         input_ids = self._tokenize(instruction)
 
         # preprocessed_logs/raw_logs use local/world Cartesian positions and
@@ -801,14 +894,21 @@ class UAVFlowHFDataset(Dataset):
         return np.concatenate([pose, velocity]).astype(np.float32)
 
     def _state8_delta_from_preprocessed(self, rows: List[List[float]], idx: int) -> np.ndarray:
+        """
+        `rows` (preprocessed_logs) holds the anchor frame at idx=0 followed
+        only by *future* steps used to build the gt_action chunk — there is
+        no frame preceding the anchor available in this per-row HF format.
+
+        Computing nxt - current here would set delta_state8 to (approximately)
+        the first ground-truth action step, i.e. leak the label into the
+        model input and mismatch the training/inference convention (where
+        delta_state8 is the *past*-to-present change, as in UAVFlowDataset's
+        `state8 - prev_state8`). We therefore return zeros, matching both
+        UAVFlowDataset's zero-history fallback at step_idx == 0 and the
+        inference server's delta_state=0 compatibility path.
+        """
         current = self._state8_from_preprocessed(rows, idx)
-        if idx + 1 >= len(rows):
-            return np.zeros_like(current)
-        nxt = self._state8_from_preprocessed(rows, idx + 1)
-        delta = nxt - current
-        delta[3] = (delta[3] + math.pi) % (2 * math.pi) - math.pi
-        delta[7] = (delta[7] + math.pi) % (2 * math.pi) - math.pi
-        return delta.astype(np.float32)
+        return np.zeros_like(current)
 
     @staticmethod
     def _yaw_delta_deg(yaw: float, yaw0: float) -> float:

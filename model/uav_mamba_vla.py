@@ -120,11 +120,25 @@ def _load_pretrained_mamba(hub_name: str):
             head_dim=64,
             tie_word_embeddings=True,
         )
-        model = Mamba2ForCausalLM.from_pretrained(
-            hub_name,
-            config=config,
-            trust_remote_code=True,
-        )
+        try:
+            model = Mamba2ForCausalLM.from_pretrained(
+                hub_name,
+                config=config,
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            # transformers >= 4.50 with torch < 2.6 refuses torch.load on
+            # pytorch_model.bin (CVE-2025-32434). The official safetensors
+            # conversion lives on refs/pr/1 of the same repo.
+            if "torch.load" not in str(e) and "safetensors" not in str(e):
+                raise
+            model = Mamba2ForCausalLM.from_pretrained(
+                hub_name,
+                config=config,
+                trust_remote_code=True,
+                revision="refs/pr/1",
+                use_safetensors=True,
+            )
         if getattr(model.backbone.embeddings.weight, "is_meta", False):
             snapshot = Path(snapshot_download(hub_name, allow_patterns=["pytorch_model.bin"]))
             state = torch.load(snapshot / "pytorch_model.bin", map_location="cpu")
@@ -466,8 +480,8 @@ class AeroMambaVLA(nn.Module):
         cache_params=None,
         return_loss:   bool  = False,
         lambda_smooth: float = 0.0,
-        lambda_endpoint: float = 2.0,
-        lambda_direction: float = 0.0,
+        lambda_endpoint: float = 0.25,
+        lambda_direction: float = 0.5,
         lambda_acc: float = 0.0,
     ) -> dict:
         """
@@ -532,6 +546,7 @@ class AeroMambaVLA(nn.Module):
             loss, detail = aero_action_loss(
                 pred,
                 gt_action,
+                head=self.action_head,
                 lambda_smooth=lambda_smooth,
                 lambda_endpoint=lambda_endpoint,
                 lambda_direction=lambda_direction,
@@ -552,11 +567,15 @@ class AeroMambaVLA(nn.Module):
         delta_state: Optional[torch.Tensor] = None,
         cache_params=None,
     ) -> dict:
-        """Single-step inference. Returns {"action": [B, K, 4]}."""
+        """
+        Single-step inference. Returns {"action": [B, K, 4]} in PHYSICAL units
+        (m / rad): raw z-space head output is denormalised via the action
+        stats buffers (identity if no stats were set).
+        """
         was_training = self.training
         try:
             self.eval()
-            return self.forward(
+            pred = self.forward(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 proprio=proprio,
@@ -565,6 +584,9 @@ class AeroMambaVLA(nn.Module):
                 cache_params=cache_params,
                 return_loss=False,
             )
+            if hasattr(self.action_head, "denormalize"):
+                pred["action"] = self.action_head.denormalize(pred["action"])
+            return pred
         finally:
             self.train(was_training)
 
@@ -590,6 +612,15 @@ class AeroMambaVLA(nn.Module):
             bias="none",
             inference_mode=False,
         )
+        # peft >= 0.18 hard-blocks LoRA on Mamba out_proj/conv1d, but our
+        # checkpoints were trained with out_proj LoRA on the slow (non-fused)
+        # transformers path where it is mathematically fine. Disable the check.
+        try:
+            from peft.tuners import tuners_utils as _tu
+            if hasattr(_tu, "_check_lora_target_modules_mamba"):
+                _tu._check_lora_target_modules_mamba = lambda *a, **k: None
+        except Exception:
+            pass
         self.mamba = get_peft_model(self.mamba, cfg)
         return self
 

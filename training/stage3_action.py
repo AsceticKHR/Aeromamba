@@ -70,6 +70,38 @@ class Stage3Trainer(BaseTrainer):
         else:
             print("[Stage3] No stage2_ckpt provided — training policy layers from scratch")
 
+        self._load_action_stats(model)
+
+    def _load_action_stats(self, model: AeroMambaVLA) -> None:
+        """Load per-(k, dim) z-score stats into the action head buffers."""
+        stats_path = getattr(self.args, "action_stats", None)
+        if not stats_path:
+            print("[Stage3] WARNING: no --action_stats given — loss runs in raw "
+                  "physical space (forward-motion dominated). Strongly consider "
+                  "running data/compute_action_stats.py first.")
+            return
+        if not Path(stats_path).exists():
+            raise FileNotFoundError(f"--action_stats file not found: {stats_path}")
+        import json
+        stats = json.loads(Path(stats_path).read_text(encoding="utf-8"))
+        if int(stats["chunk_size"]) != int(getattr(self.args, "chunk_size", 5)):
+            raise ValueError(
+                f"action_stats chunk_size={stats['chunk_size']} does not match "
+                f"--chunk_size={getattr(self.args, 'chunk_size', 5)}"
+            )
+        if float(stats.get("pos_scale", 100.0)) != float(getattr(self.args, "pos_scale", 100.0)):
+            raise ValueError(
+                f"action_stats pos_scale={stats.get('pos_scale')} does not match "
+                f"--pos_scale={getattr(self.args, 'pos_scale', 100.0)}"
+            )
+        model.action_head.set_normalization(stats["mean"], stats["std"])
+        std = torch.as_tensor(stats["std"])
+        print(f"[Stage3] Loaded action stats from {stats_path} "
+              f"(samples={stats.get('num_samples', '?')}, "
+              f"turn_fraction={stats.get('turn_fraction', 0):.3f})")
+        print(f"         std range: min={std.min():.5f} max={std.max():.5f} "
+              f"(floored at 1e-3 in head)")
+
     def compute_loss(self, model, batch, device):
         pixels    = _to_device(batch["pixel_values"], device)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -89,8 +121,8 @@ class Stage3Trainer(BaseTrainer):
             gt_action=gt_action,
             return_loss=True,
             lambda_smooth=getattr(self.args, "lambda_smooth", 0.0),
-            lambda_endpoint=getattr(self.args, "lambda_endpoint", 2.0),
-            lambda_direction=getattr(self.args, "lambda_direction", 0.0),
+            lambda_endpoint=getattr(self.args, "lambda_endpoint", 0.25),
+            lambda_direction=getattr(self.args, "lambda_direction", 0.5),
             lambda_acc=getattr(self.args, "lambda_acc", 0.0),
         )
         return pred["loss"], pred.get("loss_detail", {})
@@ -127,15 +159,26 @@ def get_args():
     p.add_argument("--lora_r",         type=int,   default=16, help="LoRA rank (must match Stage 2)")
     p.add_argument("--lora_alpha",     type=int,   default=32, help="LoRA alpha (must match Stage 2)")
     p.add_argument("--lambda_smooth",  type=float, default=0.0)
-    p.add_argument("--lambda_endpoint", type=float, default=2.0)
-    p.add_argument("--lambda_direction", type=float, default=0.0)
+    p.add_argument("--lambda_endpoint", type=float, default=0.25)
+    p.add_argument("--lambda_direction", type=float, default=0.5)
     p.add_argument("--lambda_acc",     type=float, default=0.0)
     p.add_argument("--pos_scale",      type=float, default=100.0)
+    p.add_argument("--action_stats",   default=None,
+                   help="JSON from data/compute_action_stats.py — per-(k,dim) "
+                        "z-score stats for the loss / action head buffers.")
+    p.add_argument("--oversample_turn_factor", type=int, default=1,
+                   help="Replicate turn-heavy chunks N x in the training index.")
+    p.add_argument("--oversample_turn_deg", type=float, default=10.0)
     p.add_argument("--aug_flip",       action="store_true")
+    p.add_argument("--aug_vision",     action="store_true",
+                   help="Appearance augmentation (color jitter/grayscale/blur) "
+                        "to bridge the real-photo -> Unreal domain gap.")
     p.add_argument("--val_frac",       type=float, default=0.1)
     p.add_argument("--save_dir",       default="./checkpoints/stage3")
     p.add_argument("--stage2_ckpt",    default=None, help="Stage-2 SFT model checkpoint")
     p.add_argument("--resume",         default=None, help="Resume from mid-stage checkpoint")
+    p.add_argument("--resume_model_only", action="store_true",
+                   help="Load model weights only (skip optimizer); use when trainable params change (e.g. Stage 3b).")
     p.add_argument("--workers",        type=int,   default=4)
     p.add_argument("--max_text_len",   type=int,   default=64)
     p.add_argument("--dummy_size",     type=int,   default=100)

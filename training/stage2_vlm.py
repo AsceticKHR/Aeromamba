@@ -76,6 +76,63 @@ class Stage2Trainer(BaseTrainer):
         print(f"[Stage 2] Dataset: {n_train} train  |  {n_val} val")
         return train_ds, val_ds
 
+    def get_train_sampler(self, train_ds):
+        """WeightedRandomSampler so each data source contributes an explicit
+        fraction of every epoch, decoupled from raw sample counts.
+
+        --source_weights "general=1.0,aerial_spatial=2.0,uav_motion=2.0"
+        gives *relative per-epoch mass* per source: the probability mass of
+        source s is weight_s / sum(weights of present sources), regardless of
+        how many raw samples each source has. Unknown sources default to 1.0.
+        Empty/unset --source_weights keeps plain shuffling.
+        """
+        spec = getattr(self.args, "source_weights", "") or ""
+        if not spec.strip():
+            return None
+
+        base_ds = getattr(train_ds, "dataset", train_ds)
+        sources = getattr(base_ds, "sources", None)
+        if sources is None:
+            print("[Stage 2] --source_weights set but dataset has no source tags; "
+                  "falling back to uniform shuffling")
+            return None
+
+        target_mass = {}
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, value = part.partition("=")
+            target_mass[key.strip()] = float(value)
+
+        indices = getattr(train_ds, "indices", range(len(base_ds)))
+        train_sources = [sources[i] for i in indices]
+        counts = {}
+        for s in train_sources:
+            counts[s] = counts.get(s, 0) + 1
+
+        # weight per *sample* = source mass / source count, so that the total
+        # sampled mass per source matches the requested ratio.
+        per_sample = {
+            s: target_mass.get(s, 1.0) / max(n, 1) for s, n in counts.items()
+        }
+        weights = torch.tensor(
+            [per_sample[s] for s in train_sources], dtype=torch.double
+        )
+
+        eff = {s: target_mass.get(s, 1.0) for s in counts}
+        total = sum(eff.values())
+        mix_str = "  ".join(
+            f"{s}: {counts[s]} samples -> {100.0 * eff[s] / total:.1f}%/epoch"
+            for s in sorted(counts)
+        )
+        print(f"[Stage 2] Weighted sampling by source: {mix_str}")
+
+        from torch.utils.data import WeightedRandomSampler
+        return WeightedRandomSampler(
+            weights=weights, num_samples=len(train_sources), replacement=True
+        )
+
     def compute_loss(self, model, batch, device):
         pixels    = batch["pixel_values"]
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -184,6 +241,10 @@ def get_args():
     p.add_argument("--max_steps",      type=int,   default=None)
     p.add_argument("--split_seed",    type=int,   default=42)
     p.add_argument("--max_val_steps",  type=int,   default=100)
+    p.add_argument("--source_weights", default="",
+                   help="Per-source epoch mass, e.g. "
+                        "'general=1,aerial_spatial=2,uav_motion=1.5,cognitive=0.5'. "
+                        "Empty = plain shuffling (ratio follows raw counts).")
     p.add_argument("--no_amp",         action="store_true")
     p.add_argument("--save_every_steps", type=int, default=None)
     args = p.parse_args()

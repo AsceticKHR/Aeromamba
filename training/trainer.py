@@ -92,6 +92,15 @@ class BaseTrainer(ABC):
         """
         return aero_collate_fn
 
+    def get_train_sampler(self, train_ds):
+        """Optional torch.utils.data.Sampler for the train DataLoader.
+
+        Return None (default) to use plain shuffling. Stage 2 overrides this
+        with a WeightedRandomSampler so the data-source mixing ratio is an
+        explicit knob rather than dictated by raw sample counts.
+        """
+        return None
+
     def get_dataset(self, model: AeroMambaVLA):
         """
         Build train/val datasets.
@@ -306,8 +315,11 @@ class BaseTrainer(ABC):
         pin = (self.device.type == "cuda")
         base_train_ds = getattr(train_ds, "dataset", train_ds)
         shuffle_train = not getattr(base_train_ds, "sequential_loading_preferred", False)
+        train_sampler = self.get_train_sampler(train_ds)
         train_loader = DataLoader(
-            train_ds, batch_size=batch, shuffle=shuffle_train,
+            train_ds, batch_size=batch,
+            shuffle=(shuffle_train and train_sampler is None),
+            sampler=train_sampler,
             num_workers=workers, pin_memory=pin, drop_last=True,
             collate_fn=collate_fn, persistent_workers=(workers > 0),
             prefetch_factor=4 if workers > 0 else None,

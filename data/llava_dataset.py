@@ -38,8 +38,20 @@ class LLaVADataset(Dataset):
             
         with open(json_path, "r", encoding="utf-8") as f:
             self.data = json.load(f)
-            
+
+        # Per-sample data source tag ("general" when absent). Consumed by
+        # WeightedRandomSampler in Stage2Trainer so the mixing ratio between
+        # e.g. general instruction data and aerial spatial QA is an explicit
+        # training knob instead of whatever the JSON happened to contain.
+        self.sources: List[str] = [
+            item.get("source", "general") for item in self.data
+        ]
+        source_counts: Dict[str, int] = {}
+        for s in self.sources:
+            source_counts[s] = source_counts.get(s, 0) + 1
+
         print(f"[LLaVADataset] Loaded {len(self.data)} samples from {json_path}")
+        print(f"[LLaVADataset] Source distribution: {source_counts}")
 
     def __len__(self) -> int:
         return len(self.data)

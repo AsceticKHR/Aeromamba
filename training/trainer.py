@@ -151,6 +151,11 @@ class BaseTrainer(ABC):
                 aug_vision=getattr(args, "aug_vision", False),
                 oversample_turn_factor=getattr(args, "oversample_turn_factor", 1),
                 oversample_turn_deg=getattr(args, "oversample_turn_deg", 10.0),
+                oversample_class_factor=getattr(args, "oversample_class_factor", 1),
+                emit_binding_labels=(
+                    getattr(args, "lambda_binding", 0.0) > 0.0
+                    or getattr(args, "magnitude_sample_weight", 0) > 0
+                ),
             )
 
         val_frac = getattr(args, "val_frac", 0.1)

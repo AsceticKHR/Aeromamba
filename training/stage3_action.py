@@ -34,6 +34,10 @@ class Stage3Trainer(BaseTrainer):
     """Stage 3: Action Head + ProprioEncoder fine-tuning."""
 
     def configure_model(self, model: AeroMambaVLA) -> None:
+        # Attach the training-only instruction binding head BEFORE freezing
+        # decisions so configure_stage3 can mark it trainable (AeroStream A4).
+        if getattr(self.args, "lambda_binding", 0.0) > 0.0:
+            model.enable_binding_head()
         # Freeze the large frozen stack; train the policy modules plus optional
         # resampler / Mamba-LoRA adapters for UAV-Flow dynamics adaptation.
         model.configure_stage3(train_lora=getattr(self.args, "stage3_train_lora", False))
@@ -102,6 +106,13 @@ class Stage3Trainer(BaseTrainer):
         print(f"         std range: min={std.min():.5f} max={std.max():.5f} "
               f"(floored at 1e-3 in head)")
 
+    def _channel_weights(self, device) -> torch.Tensor | None:
+        wz = float(getattr(self.args, "channel_weight_z", 1.0))
+        wyaw = float(getattr(self.args, "channel_weight_yaw", 1.0))
+        if wz == 1.0 and wyaw == 1.0:
+            return None
+        return torch.tensor([1.0, 1.0, wz, wyaw], device=device)
+
     def compute_loss(self, model, batch, device):
         pixels    = _to_device(batch["pixel_values"], device)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -111,6 +122,19 @@ class Stage3Trainer(BaseTrainer):
         if delta_state is not None:
             delta_state = delta_state.to(device, non_blocking=True)
         gt_action = batch["gt_action"].to(device, non_blocking=True)
+
+        binding_labels = batch.get("binding_labels")
+        sample_weights = None
+        if binding_labels is not None:
+            binding_labels = {
+                k: v.to(device, non_blocking=True) for k, v in binding_labels.items()
+            }
+            if int(getattr(self.args, "magnitude_sample_weight", 0)):
+                # 1 + log1p(endpoint displacement in metres): big-motion
+                # samples get proportionally more main-term gradient.
+                sample_weights = 1.0 + torch.log1p(
+                    binding_labels["endpoint_norm_m"].float().clamp_min(0.0)
+                )
 
         pred = model(
             pixel_values=pixels,
@@ -124,6 +148,10 @@ class Stage3Trainer(BaseTrainer):
             lambda_endpoint=getattr(self.args, "lambda_endpoint", 0.25),
             lambda_direction=getattr(self.args, "lambda_direction", 0.5),
             lambda_acc=getattr(self.args, "lambda_acc", 0.0),
+            binding_labels=binding_labels,
+            lambda_binding=getattr(self.args, "lambda_binding", 0.0),
+            channel_weights=self._channel_weights(device),
+            sample_weights=sample_weights,
         )
         return pred["loss"], pred.get("loss_detail", {})
 
@@ -169,6 +197,20 @@ def get_args():
     p.add_argument("--oversample_turn_factor", type=int, default=1,
                    help="Replicate turn-heavy chunks N x in the training index.")
     p.add_argument("--oversample_turn_deg", type=float, default=10.0)
+    p.add_argument("--oversample_class_factor", type=int, default=1,
+                   help="Replicate all windows of Move/Shift/Ascend/Descend/"
+                        "Surround/Rotate trajectories N x (max with turn "
+                        "oversampling, not multiplied).")
+    p.add_argument("--lambda_binding", type=float, default=0.0,
+                   help="Weight of the instruction-binding CE loss (4 tasks "
+                        "averaged); 0 disables the binding head entirely.")
+    p.add_argument("--channel_weight_z", type=float, default=1.0,
+                   help="z-space loss weight for the dz channel (main+endpoint).")
+    p.add_argument("--channel_weight_yaw", type=float, default=1.0,
+                   help="z-space loss weight for the dyaw channel (main+endpoint).")
+    p.add_argument("--magnitude_sample_weight", type=int, default=0, choices=[0, 1],
+                   help="Weight main loss per sample by 1+log1p(endpoint "
+                        "displacement m) to fight small-motion collapse.")
     p.add_argument("--aug_flip",       action="store_true")
     p.add_argument("--aug_vision",     action="store_true",
                    help="Appearance augmentation (color jitter/grayscale/blur) "

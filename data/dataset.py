@@ -99,6 +99,101 @@ def mirror_instruction_lr(text: str) -> str:
     return _LEFT_RIGHT_PATTERN.sub(_replace, text)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Instruction binding labels (AeroStream Round A)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Motion class is inferred from the instruction with ordered regex templates
+# (UAV-Flow instructions are highly templated). Unmatched instructions get
+# ignore_index=-100 and simply do not contribute to the binding CE loss.
+# Mirroring (mirror_instruction_lr) only swaps direction words and never
+# changes the motion class, so inference may run on either form.
+BINDING_IGNORE_INDEX = -100
+
+# Canonical class order — MUST match model/binding_head.py MOTION_CLASSES.
+MOTION_CLASSES = [
+    "move", "shift", "turn", "rotate", "ascend",
+    "descend", "land", "approach", "pass", "surround",
+]
+_MOTION_CLASS_TO_IDX = {name: i for i, name in enumerate(MOTION_CLASSES)}
+
+# Ordered matching rules (most specific first); the rule ORDER decides which
+# template wins, the returned index is always in MOTION_CLASSES order.
+_MOTION_CLASS_RULES: List[Tuple[str, "re.Pattern[str]"]] = [
+    ("surround", re.compile(r"\b(orbit|circle|surround|revolve|around)\b", re.I)),
+    ("land",     re.compile(r"\b(land|landing|touch\s*down)\b", re.I)),
+    ("ascend",   re.compile(r"\b(ascend|rise|climb|lift|upward|elevate)\b|\b(fly|move|go)\s+(up|higher)\b", re.I)),
+    ("descend",  re.compile(r"\b(descend|lower|downward|drop|sink)\b|\b(fly|move|go)\s+(down)\b", re.I)),
+    ("rotate",   re.compile(r"\b(rotate|spin|clockwise|counter-?clockwise|anticlockwise)\b|\bdegrees\b", re.I)),
+    ("turn",     re.compile(r"\bturn\b|\bface\b|\bfacing\b", re.I)),
+    ("pass",     re.compile(r"\b(pass|through|past)\b", re.I)),
+    ("approach", re.compile(r"\b(approach|toward|towards|closer|close\s+to|near|get\s+to|reach)\b", re.I)),
+    ("shift",    re.compile(r"\b(shift|sideways|laterally|strafe|side|translate|translating|translation)\b", re.I)),
+    ("move",     re.compile(r"\b(move|moving|fly|go|proceed|advance|head|forward|backward|retreat|withdraw|navigate)\b|\b(back(ing)?|step(ping)?)\s+(up|away|out|off|back)\b", re.I)),
+]
+
+# Classes whose windows get whole-class oversampling (change plan §A2): the
+# motion primitives that stage3_v2 diagnostics showed frozen / collapsed.
+OVERSAMPLE_MOTION_CLASSES = {"move", "shift", "ascend", "descend", "surround", "rotate"}
+
+# Chunk-endpoint displacement norm (metres), log-spaced → 9 bins.
+MAGNITUDE_BIN_EDGES = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+
+YAW_SIGN_THRESHOLD_RAD = math.radians(2.0)   # |Δyaw endpoint| > 2°
+DZ_SIGN_THRESHOLD_M = 0.05                    # |Δz endpoint| > 0.05 m
+
+
+def infer_motion_class(instruction: str) -> int:
+    """Instruction → motion class index in MOTION_CLASSES order, or
+    BINDING_IGNORE_INDEX when no template matches."""
+    for class_name, pattern in _MOTION_CLASS_RULES:
+        if pattern.search(instruction):
+            return _MOTION_CLASS_TO_IDX[class_name]
+    return BINDING_IGNORE_INDEX
+
+
+def binding_labels_from_action(
+    gt_action: torch.Tensor,
+    motion_class: int,
+) -> Dict[str, torch.Tensor]:
+    """
+    Derive binding labels from the (possibly flipped) gt_action chunk [K, 4]
+    in normalised units (positions ~metres, yaw radians). gt_action rows are
+    cumulative offsets from the anchor, so the endpoint row IS the chunk
+    displacement. Because these are computed AFTER flip augmentation, the
+    labels stay consistent with the mirrored action targets for free.
+    """
+    endpoint = gt_action[-1]
+    dyaw = float(endpoint[3])
+    dz = float(endpoint[2])
+    disp_m = float(torch.linalg.vector_norm(endpoint[:3]))
+
+    if dyaw > YAW_SIGN_THRESHOLD_RAD:
+        yaw_sign = 1
+    elif dyaw < -YAW_SIGN_THRESHOLD_RAD:
+        yaw_sign = 2
+    else:
+        yaw_sign = 0
+
+    if dz > DZ_SIGN_THRESHOLD_M:
+        dz_sign = 1
+    elif dz < -DZ_SIGN_THRESHOLD_M:
+        dz_sign = 2
+    else:
+        dz_sign = 0
+
+    magnitude_bin = bisect.bisect_right(MAGNITUDE_BIN_EDGES, disp_m)
+
+    return {
+        "motion_class": torch.tensor(motion_class, dtype=torch.long),
+        "yaw_sign": torch.tensor(yaw_sign, dtype=torch.long),
+        "dz_sign": torch.tensor(dz_sign, dtype=torch.long),
+        "magnitude_bin": torch.tensor(magnitude_bin, dtype=torch.long),
+        # endpoint norm for magnitude-aware sample weighting in the loss
+        "endpoint_norm_m": torch.tensor(disp_m, dtype=torch.float32),
+    }
+
+
 def parse_proprio(state: List[List[float]]) -> np.ndarray:
     """
     Extract [rel_x, rel_y, rel_z, rel_yaw] from UAV-Flow state format:
@@ -176,6 +271,8 @@ class UAVFlowDataset(Dataset):
         aug_vision:    bool  = False,
         oversample_turn_factor: int = 1,
         oversample_turn_deg: float = 10.0,
+        oversample_class_factor: int = 1,
+        emit_binding_labels: bool = False,
         json_extension:str   = ".json",
     ):
         super().__init__()
@@ -216,11 +313,19 @@ class UAVFlowDataset(Dataset):
                 "Check data_root path."
             )
 
+        self.emit_binding_labels = emit_binding_labels
+
         # Build flat index: (traj_file_idx, step_idx) for each valid chunk
         self.index: List[Tuple[int, int]] = []
         self.trajectories: List[List[Dict[str, Any]]] = []
+        # Per-trajectory motion class (regex over the unmirrored instruction;
+        # mirroring never changes the class).
+        self.traj_motion_class: List[int] = []
         oversample = max(1, int(oversample_turn_factor)) if split == "train" else 1
+        class_oversample = max(1, int(oversample_class_factor)) if split == "train" else 1
         n_turn_samples = 0
+        n_class_samples = 0
+        class_counter: Dict[int, int] = {}
 
         for traj_idx, traj_path in enumerate(self.traj_files):
             traj = self._load_trajectory(traj_path)
@@ -228,6 +333,26 @@ class UAVFlowDataset(Dataset):
                 continue
             self.trajectories.append(traj)
             t = len(self.trajectories) - 1
+
+            instruction = (
+                traj[0].get("instruction")
+                or traj[0].get("instruction_unified")
+                or ""
+            )
+            motion_class = infer_motion_class(instruction)
+            self.traj_motion_class.append(motion_class)
+            class_counter[motion_class] = class_counter.get(motion_class, 0) + 1
+            class_name = (
+                MOTION_CLASSES[motion_class]
+                if motion_class != BINDING_IGNORE_INDEX
+                else None
+            )
+            traj_class_factor = (
+                class_oversample
+                if class_name in OVERSAMPLE_MOTION_CLASSES
+                else 1
+            )
+
             yaws = None
             if oversample > 1:
                 yaws = [
@@ -237,6 +362,7 @@ class UAVFlowDataset(Dataset):
             # Sliding window: every step where a full K-chunk is available
             for step_idx in range(len(traj) - chunk_size + 1):
                 self.index.append((t, step_idx))
+                turn_factor = 1
                 if yaws is not None:
                     yaw0 = yaws[step_idx]
                     max_dyaw = max(
@@ -244,17 +370,32 @@ class UAVFlowDataset(Dataset):
                         for k in range(chunk_size)
                     )
                     if max_dyaw >= oversample_turn_deg:
-                        self.index.extend([(t, step_idx)] * (oversample - 1))
+                        turn_factor = oversample
                         n_turn_samples += 1
+                # Turn- and class-oversampling combine via max, not multiply
+                # (change plan §A2), so turn-heavy windows in oversampled
+                # classes are not double-boosted.
+                factor = max(turn_factor, traj_class_factor)
+                if factor > 1:
+                    self.index.extend([(t, step_idx)] * (factor - 1))
+                    if factor == traj_class_factor and turn_factor <= traj_class_factor:
+                        n_class_samples += 1
 
         if oversample > 1:
-            base = len(self.index) - n_turn_samples * (oversample - 1)
-            eff = n_turn_samples * oversample / max(len(self.index), 1)
             print(
                 f"[UAVFlowDataset] Turn oversampling x{oversample}: "
-                f"{n_turn_samples}/{base} turn chunks (>{oversample_turn_deg}deg) "
-                f"-> effective turn fraction {100.0 * eff:.1f}% "
+                f"{n_turn_samples} turn chunks (>{oversample_turn_deg}deg) "
                 f"({len(self.index)} total samples)"
+            )
+        if class_oversample > 1:
+            named = {
+                (MOTION_CLASSES[k] if k != BINDING_IGNORE_INDEX else "unmatched"): v
+                for k, v in sorted(class_counter.items(), key=lambda kv: -kv[1])
+            }
+            print(
+                f"[UAVFlowDataset] Class oversampling x{class_oversample} for "
+                f"{sorted(OVERSAMPLE_MOTION_CLASSES)}: {n_class_samples} class-boosted "
+                f"windows; trajectory class counts: {named}"
             )
 
         if not self.index:
@@ -314,7 +455,7 @@ class UAVFlowDataset(Dataset):
             delta_state8 = self._flip_state8(delta_state8)
             gt_action = self._flip_action(gt_action)
 
-        return {
+        sample = {
             "pixel_values": pixel_values,   # Tensor [3,H,W] or dict of Tensors
             "input_ids":    input_ids,
             "proprio":      proprio,
@@ -322,6 +463,14 @@ class UAVFlowDataset(Dataset):
             "delta_state8": delta_state8,
             "gt_action":    gt_action,
         }
+        if self.emit_binding_labels:
+            # Labels are derived from the POST-flip gt_action, so yaw/dz signs
+            # automatically match the mirrored targets; motion class comes
+            # from the trajectory template match (flip-invariant).
+            sample["binding_labels"] = binding_labels_from_action(
+                gt_action, self.traj_motion_class[traj_idx]
+            )
+        return sample
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -608,6 +757,19 @@ class UAVFlowHFDataset(Dataset):
         self.pos_scale = pos_scale
         self.aug_flip = aug_flip
         self.sequential_loading_preferred = False
+        # AeroStream hygiene (change plan §A7): this per-row HF format carries
+        # no frame BEFORE the anchor, so delta_state8 is forced to zero and
+        # velocity4 at the anchor is zero — a REAL train/infer mismatch with
+        # the current server (which sends non-zero per-step velocity/delta).
+        # The production Stage-3 path uses UAVFlowDataset (--data_root) whose
+        # temporal channels are computed from past frames and are correct.
+        print(
+            "[UAVFlowHFDataset] WARNING: per-row HF format has no pre-anchor "
+            "frame -> anchor velocity/delta_state8 are ZERO, which mismatches "
+            "the inference server's non-zero temporal channels. Prefer "
+            "UAVFlowDataset via --data_root for Stage-3 training; only use "
+            "this path if you re-export rows with a preceding anchor frame."
+        )
         self._parquet_files: List[Path] = []
         self._logical_row_groups: List[Tuple[int, int, int]] = []
         self._logical_cumsum: List[int] = []
@@ -901,11 +1063,14 @@ class UAVFlowHFDataset(Dataset):
 
         Computing nxt - current here would set delta_state8 to (approximately)
         the first ground-truth action step, i.e. leak the label into the
-        model input and mismatch the training/inference convention (where
-        delta_state8 is the *past*-to-present change, as in UAVFlowDataset's
-        `state8 - prev_state8`). We therefore return zeros, matching both
-        UAVFlowDataset's zero-history fallback at step_idx == 0 and the
-        inference server's delta_state=0 compatibility path.
+        model input. We therefore return zeros — the only leak-free option
+        for this format, but note this is a KNOWN train/infer mismatch: the
+        inference server sends non-zero per-step velocity/delta after the
+        first frame of an episode (only UAVFlowDataset's step_idx == 0
+        windows are legitimately zero). Fixing it properly requires
+        re-exporting rows with one pre-anchor frame; until then this path
+        should not be used for Stage-3 training (see the constructor
+        warning).
         """
         current = self._state8_from_preprocessed(rows, idx)
         return np.zeros_like(current)

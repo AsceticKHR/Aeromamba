@@ -253,6 +253,8 @@ def aero_action_loss(
     lambda_endpoint: float = 0.25,
     lambda_direction: float = 0.5,
     lambda_acc: float = 0.0,
+    channel_weights: torch.Tensor | None = None,  # [4] per-DOF weights (z-space main+endpoint)
+    sample_weights: torch.Tensor | None = None,   # [B] per-sample weights (main term)
 ) -> tuple:
     """
     Action-chunk loss in per-(k, dim) z-score space.
@@ -278,6 +280,15 @@ def aero_action_loss(
     normalisation stats; otherwise the loss operates in physical space
     (backward compatible with old checkpoints / no-stats runs).
 
+    AeroStream Round-A weighting (change plan §A3):
+      channel_weights : [4] per-DOF weights applied to the z-space main and
+                        endpoint terms (e.g. [1,1,2.5,2.5] boosts dz/dyaw,
+                        whose std is ~1/8 of dx — the collapsed channels).
+      sample_weights  : [B] per-sample weights for the main term, from
+                        1 + log1p(endpoint displacement in metres): large-
+                        displacement samples get more gradient, countering
+                        the regression-to-small-mean collapse.
+
     Returns:
         (total_loss, detail_dict)
     """
@@ -290,11 +301,27 @@ def aero_action_loss(
         gt_norm = gt_action
         pred_phys = pred_action
 
-    # Main: pure L1 in normalised space
-    loss_main = F.l1_loss(pred_action, gt_norm)
+    if channel_weights is not None:
+        cw = channel_weights.to(device=pred_action.device, dtype=pred_action.dtype)
+        cw = cw / cw.mean().clamp_min(1e-6)   # keep the loss scale comparable
+    else:
+        cw = None
+
+    # Main: pure L1 in normalised space (optionally channel/sample weighted)
+    err_main = (pred_action - gt_norm).abs()          # [B, K, 4]
+    if cw is not None:
+        err_main = err_main * cw
+    if sample_weights is not None:
+        sw = sample_weights.to(device=err_main.device, dtype=err_main.dtype)
+        sw = sw / sw.mean().clamp_min(1e-6)           # normalise batch mass
+        err_main = err_main * sw.view(-1, 1, 1)
+    loss_main = err_main.mean()
 
     # Endpoint: extra weight on the final waypoint
-    loss_endpoint = F.l1_loss(pred_action[:, -1], gt_norm[:, -1])
+    err_end = (pred_action[:, -1] - gt_norm[:, -1]).abs()
+    if cw is not None:
+        err_end = err_end * cw
+    loss_endpoint = err_end.mean()
 
     # Direction: endpoint xy heading in physical space
     pred_xy = pred_phys[:, -1, :2].float()

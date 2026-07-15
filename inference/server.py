@@ -59,6 +59,7 @@ _prev_pose4:  torch.Tensor | None = None   # [1, 4] normalized pose for velocity
 _prev_vel4:   torch.Tensor | None = None   # [1, 4] previous per-step velocity
 _prev_state8: torch.Tensor | None = None   # [1, 8] pose + velocity, matches Stage-3 training
 _last_exec_steps: int = 1                  # waypoints the client executed since last /predict
+_stream_frame: int = 0                     # frames fed to the stream cache this episode
 _token_cache: dict = {}                    # instruction → input_ids (CPU)
 _diag_step: int = 0
 _diag_episode: int = 0
@@ -420,7 +421,7 @@ def _emit_diag(diag: dict) -> None:
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    global _diag_step
+    global _diag_step, _stream_frame
     t0   = time.time()
     data = request.get_json(force=True)
 
@@ -435,16 +436,34 @@ def predict():
         input_ids = preprocess_instruction(instr)
         t_pre = time.time()
 
-        # Model inference (predict_step denormalizes to physical m/rad units)
+        # Model inference (both paths denormalize to physical m/rad units)
         use_bf16 = bool(getattr(_args, "bf16", False)) and _device.type == "cuda"
+        use_stream = bool(getattr(_args, "stream", 0))
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                pred = _model.predict_step(
-                    pixel_values=pixels,
-                    input_ids=input_ids,
-                    state=state,
-                    delta_state=delta,
-                )
+                if use_stream:
+                    # AeroStream B3: carry Mamba state across control steps.
+                    # Text is injected on the first frame of the episode and
+                    # every --stream_text_refresh frames (0 = first only).
+                    first_frame = _model._stream_cache is None
+                    refresh = int(getattr(_args, "stream_text_refresh", 0))
+                    need_text = first_frame or (
+                        refresh > 0 and _stream_frame > 0 and _stream_frame % refresh == 0
+                    )
+                    pred = _model.stream_step(
+                        pixel_values=pixels,
+                        state=state,
+                        delta_state=delta,
+                        input_ids=input_ids if need_text else None,
+                    )
+                    _stream_frame += 1
+                else:
+                    pred = _model.predict_step(
+                        pixel_values=pixels,
+                        input_ids=input_ids,
+                        state=state,
+                        delta_state=delta,
+                    )
         if _device.type == "cuda":
             torch.cuda.synchronize()
         t_model = time.time()
@@ -497,7 +516,8 @@ def predict():
 def reset():
     """Reset episode state (ensemble buffer + state8 history)."""
     global _prev_pose4, _prev_vel4, _prev_state8, _last_exec_steps
-    global _diag_step, _diag_episode
+    global _diag_step, _diag_episode, _stream_frame
+    _stream_frame = 0
     _ensemble.reset()
     _prev_pose4 = None
     _prev_vel4 = None
@@ -505,8 +525,11 @@ def reset():
     _last_exec_steps = 1
     _diag_episode += 1
     _diag_step = 0
+    if _model is not None and hasattr(_model, "stream_reset"):
+        _model.stream_reset()
     logger.info(
-        "Reset: ensemble buffer and state8 history cleared (diagnose episode=%s)",
+        "Reset: ensemble buffer, state8 history and stream cache cleared "
+        "(diagnose episode=%s)",
         _diag_episode,
     )
     return jsonify({"status": "ok", "episode": _diag_episode})
@@ -521,6 +544,8 @@ def health():
             "model": model_name,
             "diagnose": bool(getattr(_args, "diagnose", False)) if _args else False,
             "exec_mode": getattr(_args, "exec_mode", None) if _args else None,
+            "stream": bool(getattr(_args, "stream", 0)) if _args else False,
+            "stream_frame": _stream_frame,
             "episode": _diag_episode,
             "step": _diag_step,
         }
@@ -643,6 +668,19 @@ def get_args():
                    help="Per-waypoint xyz increment cap in cm (0 disables).")
     p.add_argument("--max_yaw_step_deg", type=float, default=12.0,
                    help="Per-waypoint |yaw| increment cap in degrees (0 disables).")
+    p.add_argument("--stream", type=int, default=0, choices=[0, 1],
+                   help=(
+                       "AeroStream mode: carry the Mamba recurrent state "
+                       "across control steps (per-episode flight memory). "
+                       "Forces exec_mode=single_step (receding horizon, "
+                       "re-query every step). 0 keeps the exact legacy "
+                       "single-frame behaviour."
+                   ))
+    p.add_argument("--stream_text_refresh", type=int, default=0,
+                   help=(
+                       "Re-inject the instruction tokens every N streamed "
+                       "frames to counter state drift (0 = first frame only)."
+                   ))
     p.add_argument("--warmup", type=int, default=2,
                    help="Warmup forward passes at startup (kernel autotune).")
     p.add_argument("--diagnose", action="store_true",
@@ -676,6 +714,17 @@ def main():
 
     if getattr(_args, "ensemble_mode", False):
         _args.exec_mode = "ensemble"
+
+    if bool(getattr(_args, "stream", 0)):
+        # μVLA discipline: streaming memory requires re-querying every step;
+        # executing multi-step chunks between memory updates breaks recall.
+        if _args.exec_mode != "single_step":
+            logger.info(
+                "Stream mode: forcing exec_mode=%s -> single_step (exec_horizon=1)",
+                _args.exec_mode,
+            )
+        _args.exec_mode = "single_step"
+        _args.exec_horizon = 1
 
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {_device}")

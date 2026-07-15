@@ -63,6 +63,7 @@ from .vision          import build_vision_encoder, DinoSigLIPEncoder
 from .projector       import MLPProjector
 from .proprio_encoder import ProprioEncoder
 from .action_head     import UAVActionHead, UAVDynamicsActionHead, aero_action_loss
+from .binding_head    import InstructionBindingHead, binding_loss
 from .resampler       import PerceiverResampler
 
 
@@ -139,16 +140,65 @@ def _load_pretrained_mamba(hub_name: str):
                 revision="refs/pr/1",
                 use_safetensors=True,
             )
-        if getattr(model.backbone.embeddings.weight, "is_meta", False):
-            snapshot = Path(snapshot_download(hub_name, allow_patterns=["pytorch_model.bin"]))
-            state = torch.load(snapshot / "pytorch_model.bin", map_location="cpu")
-            weight = state["backbone.embedding.weight"]
+
+        # transformers 5.x remaps hub key `backbone.embedding.weight` → expected
+        # `backbone.embeddings.weight`, leaving randomly-init embeddings + untied
+        # lm_head. Older code only healed `is_meta` tensors; also heal the
+        # randomly-initialized case so Stage-2 CLM eval is not garbage.
+        def _restore_mamba2_embeddings(m):
+            emb_mod = getattr(m.backbone, "embeddings", None)
+            if emb_mod is None:
+                emb_mod = getattr(m.backbone, "embedding", None)
+            needs = (
+                emb_mod is None
+                or getattr(emb_mod.weight, "is_meta", False)
+                or getattr(m, "lm_head", None) is None
+                or not hasattr(m.lm_head, "weight")
+                or m.lm_head.weight.data_ptr() != emb_mod.weight.data_ptr()
+            )
+            # Also detect "fresh random" load: hub uses embedding (singular).
+            hub_state = None
+            for patterns, loader in (
+                (["*.safetensors"], "sf"),
+                (["pytorch_model.bin"], "bin"),
+            ):
+                try:
+                    snap = Path(snapshot_download(hub_name, allow_patterns=patterns))
+                except Exception:
+                    continue
+                sf = list(snap.glob("*.safetensors"))
+                if loader == "sf" and sf:
+                    from safetensors.torch import load_file
+                    hub_state = load_file(sf[0])
+                    break
+                bin_path = snap / "pytorch_model.bin"
+                if loader == "bin" and bin_path.is_file():
+                    hub_state = torch.load(bin_path, map_location="cpu", weights_only=False)
+                    break
+            if hub_state is None:
+                return m
+            weight = hub_state.get("backbone.embedding.weight")
+            if weight is None:
+                weight = hub_state.get("backbone.embeddings.weight")
+            if weight is None:
+                return m
+            if not needs:
+                # Even if tied, overwrite in case singular→plural remap dropped values
+                # (UNEXPECTED embedding + MISSING embeddings leaves random init).
+                pass
             embedding = nn.Embedding(weight.shape[0], weight.shape[1])
             embedding.weight.data.copy_(weight)
-            model.backbone.embeddings = embedding
-            model.lm_head = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
-            model.lm_head.weight = model.backbone.embeddings.weight
-        return model
+            m.backbone.embeddings = embedding
+            if hasattr(m.backbone, "embedding"):
+                try:
+                    delattr(m.backbone, "embedding")
+                except Exception:
+                    pass
+            m.lm_head = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+            m.lm_head.weight = m.backbone.embeddings.weight
+            return m
+
+        return _restore_mamba2_embeddings(model)
     config = AutoConfig.from_pretrained(hub_name, trust_remote_code=True)
     model_cls = _mamba_model_cls(config)
     return model_cls.from_pretrained(
@@ -349,9 +399,25 @@ class AeroMambaVLA(nn.Module):
                 "Choose from: 'mlp', 'dynamics'."
             )
 
+        # ── 6. Instruction Binding Head (training-only, AeroStream A1) ─────
+        # Created lazily via enable_binding_head() so inference-only builds
+        # and old checkpoints are byte-identical to the previous behaviour.
+        self.binding_head: Optional[InstructionBindingHead] = None
+
+        # Streaming inference state (AeroStream B2). Not registered as
+        # buffers/params — pure runtime cache, reset per episode.
+        self._stream_cache = None
+        self._stream_pos = 0
+
         # Store key dimensions
         self.D_m = D_m
         self.D_v = D_v
+
+    def enable_binding_head(self) -> InstructionBindingHead:
+        """Attach the training-only instruction binding head (idempotent)."""
+        if self.binding_head is None:
+            self.binding_head = InstructionBindingHead(hidden_size=self.D_m)
+        return self.binding_head
 
     # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -483,6 +549,10 @@ class AeroMambaVLA(nn.Module):
         lambda_endpoint: float = 0.25,
         lambda_direction: float = 0.5,
         lambda_acc: float = 0.0,
+        binding_labels: Optional[Dict[str, torch.Tensor]] = None,
+        lambda_binding: float = 0.0,
+        channel_weights: Optional[torch.Tensor] = None,
+        sample_weights: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         Multimodal forward pass.
@@ -551,11 +621,145 @@ class AeroMambaVLA(nn.Module):
                 lambda_endpoint=lambda_endpoint,
                 lambda_direction=lambda_direction,
                 lambda_acc=lambda_acc,
+                channel_weights=channel_weights,
+                sample_weights=sample_weights,
             )
+            # Instruction binding auxiliary loss (training-only bypass, A4):
+            # h_last forks into the binding head; four CE terms (each with
+            # ignore_index=-100) are averaged and folded into the total.
+            if (
+                lambda_binding > 0.0
+                and binding_labels is not None
+                and self.binding_head is not None
+            ):
+                bind_logits = self.binding_head(global_token)
+                bind_loss, bind_detail = binding_loss(bind_logits, binding_labels)
+                if bind_loss is not None:
+                    loss = loss + lambda_binding * bind_loss
+                detail.update(bind_detail)
             pred["loss"] = loss
             pred["loss_detail"] = detail
 
         return pred
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Streaming inference (AeroStream B2)
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # Mamba's recurrent state is carried ACROSS control steps: every frame we
+    # feed only the new tokens [state | delta | vision] (plus text on the
+    # first frame / periodic refresh), so the model accumulates the full
+    # flight history at O(1) cost per step. predict_step remains untouched as
+    # the single-frame fallback / A-B baseline.
+
+    def stream_reset(self) -> None:
+        """Clear the cross-step Mamba cache (call on /reset, per episode)."""
+        self._stream_cache = None
+        self._stream_pos = 0
+
+    @torch.inference_mode()
+    def stream_step(
+        self,
+        pixel_values: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        state: torch.Tensor,
+        delta_state: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """
+        One streaming control step.
+
+        First call after stream_reset() MUST include input_ids; the token
+        order is [state | delta | vision | text] exactly as in training, and
+        the action is read from the last text token. Subsequent calls feed
+        only [state | delta | vision] increments and read the action from the
+        last vision token — the instruction (and all past frames) persist in
+        the carried Mamba state. Pass input_ids again at any step to refresh
+        the instruction against state drift.
+
+        Returns {"action": [B, K, 4]} in PHYSICAL units.
+        """
+        was_training = self.training
+        try:
+            self.eval()
+            B = (
+                pixel_values["dino"].size(0)
+                if isinstance(pixel_values, dict)
+                else pixel_values.size(0)
+            )
+            device = state.device
+            ref_dtype = next(self.action_head.parameters()).dtype
+
+            state, delta_state = self._prepare_state_inputs(
+                B, device, ref_dtype, state=state, delta_state=delta_state
+            )
+            state_tokens = self.proprio_encoder.forward_pair(state, delta_state)
+
+            vis_patches = self._encode_vision(pixel_values)
+            vis_tokens = self.token_resampler(self.projector(vis_patches))
+
+            parts = [state_tokens, vis_tokens]
+            text_embs = None
+            if input_ids is not None:
+                text_embs = self._embed_text(input_ids)
+                parts.append(text_embs)
+            inputs_embeds = torch.cat(parts, dim=1)
+
+            first_step = self._stream_cache is None
+            if first_step and input_ids is None:
+                raise ValueError(
+                    "stream_step: first call after stream_reset() must "
+                    "include input_ids (instruction tokens)."
+                )
+
+            backbone = self.mamba.backbone
+            if first_step:
+                # Prefill: transformers handles multi-token sequences with a
+                # fresh cache correctly and returns the populated cache
+                # (DynamicCache in tf5.x, Mamba2Cache in tf4.x — both work).
+                out = backbone(
+                    inputs_embeds=inputs_embeds,
+                    cache_params=None,
+                    use_cache=True,
+                )
+                hidden = out.last_hidden_state
+                self._stream_cache = out.cache_params
+            else:
+                # Incremental: the cached path in transformers' Mamba/Mamba2
+                # mixers only supports seq_len == 1 once the cache holds a
+                # previous state (step branch does projected_states.squeeze(1)),
+                # so multi-token frame increments are fed token by token.
+                hiddens = []
+                for i in range(inputs_embeds.size(1)):
+                    out = backbone(
+                        inputs_embeds=inputs_embeds[:, i : i + 1],
+                        cache_params=self._stream_cache,
+                        use_cache=True,
+                    )
+                    hiddens.append(out.last_hidden_state)
+                    self._stream_cache = out.cache_params
+                hidden = torch.cat(hiddens, dim=1)
+            self._stream_pos += inputs_embeds.size(1)
+
+            if text_embs is not None:
+                pad_id = getattr(self.tokenizer, "pad_token_id", 0)
+                text_mask = (input_ids != pad_id).to(hidden.dtype)
+                text_lengths = text_mask.sum(dim=1).long().clamp_min(1) - 1
+                prefix_len = state_tokens.size(1) + vis_tokens.size(1)
+                gather_idx = (
+                    (prefix_len + text_lengths)
+                    .view(B, 1, 1)
+                    .expand(-1, 1, hidden.size(-1))
+                )
+                global_token = hidden.gather(dim=1, index=gather_idx).squeeze(1)
+            else:
+                global_token = hidden[:, -1, :]
+
+            pred = self.action_head(global_token, proprio=state)
+            if hasattr(self.action_head, "denormalize"):
+                pred["action"] = self.action_head.denormalize(pred["action"])
+            return pred
+        finally:
+            self.train(was_training)
 
     @torch.inference_mode()
     def predict_step(
@@ -652,6 +856,9 @@ class AeroMambaVLA(nn.Module):
             p.requires_grad = True
         for p in self.proprio_encoder.parameters():
             p.requires_grad = True
+        if self.binding_head is not None:
+            for p in self.binding_head.parameters():
+                p.requires_grad = True
         if not isinstance(self.token_resampler, nn.Identity):
             for p in self.token_resampler.parameters():
                 p.requires_grad = True
@@ -679,6 +886,8 @@ class AeroMambaVLA(nn.Module):
             "mamba":           self.mamba,
             "action_head":     self.action_head,
         }
+        if self.binding_head is not None:
+            modules["binding_head"] = self.binding_head
         # Break down dual encoder sub-components
         if self.is_dual_vision:
             modules["  └─ dino_featurizer"]   = self.vision_encoder.dino_featurizer

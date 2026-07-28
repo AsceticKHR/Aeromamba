@@ -223,14 +223,64 @@ class ActionStats:
                            np.asarray(d["q99"], np.float32))
 
 
-def compute_action_stats(eps: Sequence[Episode], max_episodes: int = 400,
-                         seed: int = 0) -> ActionStats:
-    """Quantile stats over per-step actions. Recompute whenever the horizon or
-    the episode subset changes -- the v2 line lost a run to stale stats."""
+def chunk_label(actions: np.ndarray, horizon: int, mode: str) -> np.ndarray:
+    """Slice a chunk and put it in the target representation.
+
+    ``cumulative`` is the default and predicts displacement from the anchor,
+    not per-step deltas. Measured reason: on this dataset the per-step
+    decomposition is close to unpredictable -- a pose-kNN with a full
+    same-instruction pool reaches 0.443 m against 0.604 m for predicting
+    zeros -- while the 20-step displacement it sums to is very predictable
+    (6.29 m against 11.82 m). An L1 loss on deltas therefore spends its
+    capacity on jitter and settles at the conditional median, which is what
+    collapsed the dz and dyaw channels to 0.3% and 0.1% of their true spread.
+    Cumulative labels also make the loss proportional to path error, which is
+    what the official soft-DTW metric scores.
+
+    Deltas for execution come back by differencing, so nothing downstream has
+    to know which representation was trained.
+    """
+    a = actions[:horizon]
+    if mode == "cumulative":
+        a = np.cumsum(a, axis=0)
+    n = len(a)
+    m = np.ones(n, dtype=np.float32)
+    if n < horizon:
+        pad = horizon - n
+        # Hold the last value for cumulative (standing still), zeros for
+        # deltas. Either way the mask keeps it out of the loss.
+        tail = np.repeat(a[-1:], pad, axis=0) if mode == "cumulative" and n \
+            else np.zeros((pad, actions.shape[1]), np.float32)
+        a = np.concatenate([a, tail])
+        m = np.concatenate([m, np.zeros(pad, np.float32)])
+    return a.astype(np.float32), m
+
+
+def to_deltas(chunk: np.ndarray, mode: str) -> np.ndarray:
+    """Target representation -> per-step deltas, for execution and for the
+    step-error metric."""
+    if mode != "cumulative":
+        return chunk
+    prev = np.zeros_like(chunk[..., :1, :])
+    return chunk - np.concatenate([prev, chunk[..., :-1, :]], axis=-2)
+
+
+def compute_action_stats(eps: Sequence[Episode], horizon: int = ACTION_HORIZON,
+                         mode: str = "cumulative", max_episodes: int = 400,
+                         stride: int = EXEC_STEPS, seed: int = 0) -> ActionStats:
+    """Quantile stats in whichever representation is being trained.
+
+    Recompute whenever the horizon, the representation, the stride or the
+    episode subset changes. The v2 line lost a run to stale stats.
+    """
     rng = random.Random(seed)
     pick = list(eps)
     rng.shuffle(pick)
-    acc = [read_episode(e.path, with_images=False)[1] for e in pick[:max_episodes]]
+    acc = []
+    for e in pick[:max_episodes]:
+        _, ac, _, _ = read_episode(e.path, with_images=False)
+        for f in range(1, max(len(ac) - horizon, 1), stride):
+            acc.append(chunk_label(ac[f:f + horizon], horizon, mode)[0])
     a = np.concatenate(acc, axis=0)
     return ActionStats(np.quantile(a, 0.01, axis=0).astype(np.float32),
                        np.quantile(a, 0.99, axis=0).astype(np.float32))
@@ -250,7 +300,7 @@ class HugeBenchWindows(IterableDataset):
                  stride: int = EXEC_STEPS, horizon: int = ACTION_HORIZON,
                  windows_per_episode: int = 4, seed: int = 0,
                  vision_rates: Sequence[int] = (1, 1, 2, 4, 0),
-                 infinite: bool = True):
+                 label_mode: str = "cumulative", infinite: bool = True):
         super().__init__()
         self.eps = episodes
         self.stats = stats
@@ -258,6 +308,7 @@ class HugeBenchWindows(IterableDataset):
         self.W = window
         self.stride = stride
         self.H = horizon
+        self.label_mode = label_mode
         self.wpe = windows_per_episode
         self.seed = seed
         # 0 means "never refresh after the first step". Sampling the rate per
@@ -320,12 +371,7 @@ class HugeBenchWindows(IterableDataset):
             px.append(last)
             upd.append(1.0 if fresh else 0.0)
 
-            a = actions[f:f + self.H]
-            m = np.ones(len(a), dtype=np.float32)
-            if len(a) < self.H:  # tail pad; masked out of the loss
-                pad = self.H - len(a)
-                a = np.concatenate([a, np.zeros((pad, a.shape[1]), np.float32)])
-                m = np.concatenate([m, np.zeros(pad, np.float32)])
+            a, m = chunk_label(actions[f:f + self.H], self.H, self.label_mode)
             chunks.append(self.stats.normalise(a))
             chunk_mask.append(m)
             stages.append(int(ep.stages[min(f, len(ep.stages) - 1)]))

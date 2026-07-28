@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from data.hugebench_dataset import (ACTION_HORIZON, EXEC_STEPS, ActionStats,
@@ -59,6 +60,8 @@ def get_args():
     p.add_argument("--window", type=int, default=4)
     p.add_argument("--stride", type=int, default=EXEC_STEPS)
     p.add_argument("--horizon", type=int, default=ACTION_HORIZON)
+    p.add_argument("--label_mode", choices=["cumulative", "delta"],
+                   default="cumulative")
     p.add_argument("--windows_per_episode", type=int, default=4)
 
     p.add_argument("--batch", type=int, default=8)
@@ -117,7 +120,8 @@ def loaders(args, model):
     if args.action_stats and Path(args.action_stats).exists():
         stats = ActionStats.load(args.action_stats)
     else:
-        stats = compute_action_stats(tr)
+        stats = compute_action_stats(tr, horizon=args.horizon,
+                                     mode=args.label_mode, stride=args.stride)
         if args.action_stats:
             stats.save(args.action_stats)
     print(f"[v3] action q01={np.round(stats.q01, 4).tolist()} "
@@ -125,7 +129,7 @@ def loaders(args, model):
 
     tf = model.vision.transform
     kw = dict(stats=stats, transform=tf, window=args.window, stride=args.stride,
-              horizon=args.horizon, seed=args.seed)
+              horizon=args.horizon, seed=args.seed, label_mode=args.label_mode)
     tr_ds = HugeBenchWindows(tr, windows_per_episode=args.windows_per_episode,
                              infinite=True, **kw)
     va_ds = HugeBenchWindows(va, windows_per_episode=2, infinite=True,
@@ -158,8 +162,20 @@ def to_dev(b, device):
 
 # ── evaluation ───────────────────────────────────────────────────────────────
 
+def _cum_and_step(x: torch.Tensor, mode: str):
+    """(B,W,H,4) in the trained representation -> (cumulative, per-step)."""
+    if mode == "cumulative":
+        return x, x - F.pad(x[..., :-1, :], (0, 0, 1, 0))
+    return x.cumsum(-2), x
+
+
 @torch.no_grad()
-def evaluate(model, loader, stats, device, n_batches, amp):
+def evaluate(model, loader, stats, device, n_batches, amp, mode="cumulative"):
+    """Reports the same three errors as scripts/hugebench_trivial_baselines.py,
+    so a policy number can be put straight next to the baseline table. They
+    disagree by an order of magnitude and the disagreement is informative:
+    step is what an L1 chunk loss fits, path is the offline proxy for the
+    official soft-DTW, endpoint is what the observability audit measured."""
     model.eval()
     span = torch.as_tensor(np.maximum(stats.q99 - stats.q01, 1e-6), device=device)
     lo = torch.as_tensor(stats.q01, device=device)
@@ -172,28 +188,37 @@ def evaluate(model, loader, stats, device, n_batches, amp):
             break
         with torch.autocast("cuda", torch.bfloat16, enabled=amp):
             o = model(b)
-        denorm = lambda a: (a.float() + 1.0) * 0.5 * span + lo
-        pe = (denorm(o["action"])[..., :3] - denorm(b["action"])[..., :3]) \
-            .norm(dim=-1)                                    # (B,W,H) metres
-        m = b["action_mask"].bool()
-        per_sample = (pe * m).sum((1, 2)) / m.sum((1, 2)).clamp(min=1)
 
-        agg["pos_err_m"].append(float(per_sample.mean()))
+        def denorm(a):
+            return (a.float() + 1.0) * 0.5 * span + lo
+
+        pc, ps = _cum_and_step(denorm(o["action"]), mode)
+        gc, gs = _cum_and_step(denorm(b["action"]), mode)
+        m = b["action_mask"].bool()
+        n = m.sum((1, 2)).clamp(min=1)
+
+        step = (((ps - gs)[..., :3].norm(dim=-1)) * m).sum((1, 2)) / n
+        path = (((pc - gc)[..., :3].norm(dim=-1)) * m).sum((1, 2)) / n
+        endp = (pc - gc)[:, :, -1, :3].norm(dim=-1).mean(1)
+
+        agg["step_err_m"].append(float(step.mean()))
+        agg["path_err_m"].append(float(path.mean()))
+        agg["endpoint_err_m"].append(float(endp.mean()))
         agg["loss"].append(float(o["loss"]))
         agg["stage_acc"].append(float(o["stage_acc"]))
         # Per-channel spread as a fraction of the data's own spread. An
         # absolute floor is not interpretable here: one step of yaw spans
         # ~0.09 rad while one step of dx spans ~1 m, so the same number means
         # "healthy" for one channel and "collapsed" for the next.
-        sp, gsp = denorm(o["action"]).std((0, 1, 2)), denorm(b["action"]).std((0, 1, 2))
+        sp, gsp = ps.std((0, 1, 2)), gs.std((0, 1, 2))
         for i, c in enumerate(("dx", "dy", "dz", "dyaw")):
-            agg[f"spread_{c}"].append(float(sp[i]))
             agg[f"spread_ratio_{c}"].append(float(sp[i] / gsp[i].clamp(min=1e-9)))
         for j, f in enumerate(b["family"]):
-            fam[f]["pos_err_m"].append(float(per_sample[j]))
+            fam[f]["path_err_m"].append(float(path[j]))
     model.train()
-    out = {k: float(np.mean(v)) for k, v in agg.items() if v}
-    out["by_family"] = {f: float(np.mean(d["pos_err_m"])) for f, d in fam.items()}
+    out = {k: round(float(np.mean(v)), 5) for k, v in agg.items() if v}
+    out["by_family"] = {f: round(float(np.mean(d["path_err_m"])), 4)
+                        for f, d in fam.items()}
     return out
 
 
@@ -265,7 +290,7 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
     n = args.g3_steps
     sched = argparse.Namespace(lr=args.lr, warmup=min(100, n // 6),
                                sched_total_steps=n, max_steps=n)
-    v0 = evaluate(model, va_loader, stats, device, 8, amp)
+    v0 = evaluate(model, va_loader, stats, device, 8, amp, args.label_mode)
     for step in range(n):
         for g in opt.param_groups:
             g["lr"] = lr_at(step, sched)
@@ -279,11 +304,15 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
         if (step + 1) % 250 == 0:
             print(f"    G3 step {step + 1}/{n} act {float(o['loss_action']):.4f} "
                   f"stage_acc {float(o['stage_acc']):.3f}", flush=True)
-    v1 = evaluate(model, va_loader, stats, device, 12, amp)
+    v1 = evaluate(model, va_loader, stats, device, 12, amp, args.label_mode)
 
-    res["G3"] = v1["pos_err_m"] < v0["pos_err_m"] and np.isfinite(v1["pos_err_m"])
-    print(f"  [G3 converges] pos_err_m {v0['pos_err_m']:.3f} -> "
-          f"{v1['pos_err_m']:.3f}  {'PASS' if res['G3'] else 'FAIL'}", flush=True)
+    res["G3"] = bool(v1["path_err_m"] < v0["path_err_m"]
+                     and np.isfinite(v1["path_err_m"]))
+    print(f"  [G3 converges] path_err_m {v0['path_err_m']:.3f} -> "
+          f"{v1['path_err_m']:.3f}  (step {v0['step_err_m']:.3f} -> "
+          f"{v1['step_err_m']:.3f}, endpoint {v0['endpoint_err_m']:.2f} -> "
+          f"{v1['endpoint_err_m']:.2f})  {'PASS' if res['G3'] else 'FAIL'}",
+          flush=True)
 
     # G4 is new for v3. The phase state is the contribution; if its head cannot
     # learn, there is nothing downstream to ablate.
@@ -336,13 +365,18 @@ def run_full(args, model, tr_loader, va_loader, stats, device, amp):
                   f"{(time.time() - t0) / step:.2f}s/it", flush=True)
 
         if step % args.val_every == 0:
-            v = evaluate(model, va_loader, stats, device, args.val_batches, amp)
+            v = evaluate(model, va_loader, stats, device, args.val_batches, amp,
+                         args.label_mode)
             v["step"] = step
             hist.append(v)
             print(f"[v3] VAL step {step} {json.dumps(v)}", flush=True)
             json.dump(hist, open(save / "val_history.json", "w"), indent=1)
-            if v["pos_err_m"] < best:
-                best = v["pos_err_m"]
+            # Selected on path error, not step: step is dominated by jitter
+            # the data does not determine, and the official metric scores the
+            # path. Selecting on the wrong one is how the v2 line ended up
+            # picking its most vision-blind checkpoints.
+            if v["path_err_m"] < best:
+                best = v["path_err_m"]
                 torch.save({"model": {k: p for k, p in model.state_dict().items()
                                       if p.dtype.is_floating_point},
                             "cfg": vars(args), "val": v, "step": step},

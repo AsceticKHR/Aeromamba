@@ -81,8 +81,10 @@ def get_args():
 
     # Gate budgets. 60 steps was not an overfit test, it was a warm-up: the
     # action loss was still falling steeply when it was cut off.
-    p.add_argument("--g1_steps", type=int, default=300)
-    p.add_argument("--g3_steps", type=int, default=1500)
+    p.add_argument("--g1_steps", type=int, default=400)
+    p.add_argument("--g1_batches", type=int, default=3,
+                   help="batches held fixed for the overfit gates")
+    p.add_argument("--g3_steps", type=int, default=3000)
 
     p.add_argument("--out", default="checkpoints")
     p.add_argument("--tag", default="v3")
@@ -225,44 +227,67 @@ def evaluate(model, loader, stats, device, n_batches, amp, mode="cumulative"):
 
 # ── smoke gates ──────────────────────────────────────────────────────────────
 
-# Per-channel spread that a memoryless pose-kNN with a same-instruction fit
-# pool retains, measured on the cumulative chunk over 5,425 held-out windows
-# by scripts/hugebench_trivial_baselines.py. G5 wants at least half of this.
+# Best per-channel spread any trivial predictor retains on the cumulative
+# chunk, over 5,425 held-out windows (scripts/hugebench_trivial_baselines.py).
+# Channel-wise max of pose-kNN (0.816/0.900/0.453/0.623) and class-progress
+# (0.348/0.649/0.714/0.480). G5 wants at least half of it.
 #
 # The point of keying the gate to a measurement: a well-behaved conditional
 # predictor *always* has less spread than the data, because it drops the part
-# the observation does not determine. dz genuinely retains only 0.453 while dy
-# retains 0.900, so a single floor would either wave through a collapsed dz or
-# fail a healthy one. Over-dispersion is a failure too -- exceeding the data's
-# own spread means variance is being injected, which is how the v2 line's
-# lambda_var produced a policy that moved a lot and tracked nothing.
-KNN_SPREAD = {"dx": 0.816, "dy": 0.900, "dz": 0.453, "dyaw": 0.623}
+# the observation does not determine, so a single floor cannot separate
+# "collapsed" from "correctly unsure". The two references also disagree per
+# channel in a way that is itself informative -- dz is the one channel where
+# class-progress beats pose-kNN, 0.714 against 0.453, and where class-mean
+# without progress collapses to 0.088. Altitude is set by how far along the
+# flight is, not by the instruction, which is precisely the quantity the phase
+# state exists to estimate.
+#
+# Both references are optimistic and neither is a conditional mean: kNN over a
+# handful of neighbours keeps sampling noise, and class-progress reads the
+# true progress off the frame index, which no policy has at test time. Halving
+# them is the concession to that.
+#
+# Over-dispersion is a failure too -- exceeding the data's own spread means
+# variance is being injected, which is how the v2 line's lambda_var produced a
+# policy that moved a lot and tracked nothing.
+TRIVIAL_SPREAD = {"dx": 0.816, "dy": 0.900, "dz": 0.714, "dyaw": 0.623}
 
-def _batch_mean_loss(batch) -> float:
-    """Masked L1 of the best constant-per-horizon-index predictor on this
-    batch. This is the reference G1 has to beat.
+def _mean_loss(batches) -> float:
+    """Masked L1 of the best constant-per-horizon-index predictor on the
+    overfit set. This is the reference G1 has to beat.
 
     The loss at random init is not a usable reference: it depends on the label
     representation, so the same 0.25x threshold means different things for
-    deltas and for cumulative displacement. Beating the batch's own mean ramp
-    by 4x means the same thing in both.
+    deltas and for cumulative displacement. Beating the set's own mean ramp by
+    4x means the same thing in both.
     """
-    a, m = batch["action"], batch["action_mask"].unsqueeze(-1)
+    a = torch.cat([b["action"] for b in batches])
+    m = torch.cat([b["action_mask"] for b in batches]).unsqueeze(-1)
     mu = (a * m).sum((0, 1), keepdim=True) / m.sum((0, 1), keepdim=True).clamp(min=1)
     return float(((a - mu).abs() * m).sum() / (m.sum() * a.shape[-1]).clamp(min=1))
 
 
-def gate_overfit(model, batch, device, steps, lr, amp, label, const_instr=False,
-                 target=0.25):
+def gate_overfit(model, batches, device, steps, lr, amp, label,
+                 const_instr=False, target=0.25):
     """G1 / G1v. G1v pins every instruction to one string: if the loss still
     falls, vision and pose alone can drive the action, which separates a wrong
-    architecture from an undertrained one."""
+    architecture from an undertrained one.
+
+    Full-batch gradient over several batches, not one. On a single batch of 8
+    the same code gave 0.03x and 0.24x on consecutive runs, and G1v swung
+    0.11x / 0.57x -- a gate that decides whether the architecture is sound
+    cannot be a coin flip on which windows the loader happened to yield.
+    """
     if const_instr:
-        batch = dict(batch)
-        n = batch["input_ids"].shape[0]
-        batch["input_ids"] = batch["input_ids"][:1].repeat(n, 1)
-        batch["attention_mask"] = batch["attention_mask"][:1].repeat(n, 1)
-    ref = _batch_mean_loss(batch)
+        pinned = []
+        for b in batches:
+            b = dict(b)
+            n = b["input_ids"].shape[0]
+            b["input_ids"] = batches[0]["input_ids"][:1].repeat(n, 1)
+            b["attention_mask"] = batches[0]["attention_mask"][:1].repeat(n, 1)
+            pinned.append(b)
+        batches = pinned
+    ref = _mean_loss(batches)
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr)
     # Cosine to zero. A constant lr leaves AdamW taking a fixed-size step
     # forever, which puts a noise floor under the loss and makes an overfit
@@ -270,39 +295,55 @@ def gate_overfit(model, batch, device, steps, lr, amp, label, const_instr=False,
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
     first = last = None
     for i in range(steps):
-        with torch.autocast("cuda", torch.bfloat16, enabled=amp):
-            o = model(batch)
         opt.zero_grad(set_to_none=True)
-        o["loss"].backward()
+        tot = 0.0
+        for b in batches:
+            with torch.autocast("cuda", torch.bfloat16, enabled=amp):
+                o = model(b)
+            (o["loss"] / len(batches)).backward()
+            tot += float(o["loss_action"]) / len(batches)
         opt.step()
         sch.step()
-        last = float(o["loss_action"])
+        last = tot
         if i == 0:
             first = last
         elif (i + 1) % 100 == 0:
             print(f"    {label} step {i + 1}: {last:.4f} "
                   f"({last / max(ref, 1e-9):.2f}x mean)", flush=True)
-    ok = last < target * ref
+    r = last / max(ref, 1e-9)
+    ok = r < target
     print(f"  [{label}] action loss {first:.4f} -> {last:.4f}; "
-          f"batch-mean predictor {ref:.4f} -> {last / max(ref, 1e-9):.2f}x, "
-          f"need <{target}  {'PASS' if ok else 'FAIL'}", flush=True)
-    return ok
+          f"mean-ramp predictor {ref:.4f} -> {r:.2f}x, "
+          f"need <{target:.2f}  {'PASS' if ok else 'FAIL'}", flush=True)
+    return r
 
 
 def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
     print("\n[v3] ===== smoke gates =====", flush=True)
     res = {}
     it = iter(tr_loader)
-    batch = to_dev(next(it), device)
+    batches = [to_dev(next(it), device) for _ in range(args.g1_batches)]
+    batch = batches[0]
 
     import copy
     base = copy.deepcopy(model.state_dict())
 
-    res["G1"] = gate_overfit(model, batch, device, args.g1_steps, 1e-3, amp,
-                             "G1 overfit")
+    r1 = gate_overfit(model, batches, device, args.g1_steps, 1e-3, amp,
+                      "G1 overfit")
+    res["G1"] = bool(r1 < 0.25)
     model.load_state_dict(base)
-    res["G1v"] = gate_overfit(model, batch, device, args.g1_steps, 1e-3, amp,
-                              "G1v const-instruction", const_instr=True)
+
+    # G1v is strictly harder than G1: an input has been removed, so it cannot
+    # share G1's threshold. What it has to show is that most of what the model
+    # learns is reachable without the instruction, so it is scored against G1
+    # itself -- it must close at least half the gap G1 closes. Self-calibrating,
+    # and it tightens automatically if G1 gets stronger.
+    rv = gate_overfit(model, batches, device, args.g1_steps, 1e-3, amp,
+                      "G1v const-instruction", const_instr=True,
+                      target=1.0 - 0.5 * (1.0 - r1))
+    res["G1v"] = bool((1.0 - rv) > 0.5 * (1.0 - r1))
+    print(f"       G1v closes {100 * (1 - rv) / max(1 - r1, 1e-9):.0f}% of the "
+          f"gap G1 closes; need >50%", flush=True)
     model.load_state_dict(base)
 
     # G2: the frozen parts must be exactly zero, not small. A non-zero here
@@ -339,6 +380,14 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
         if (step + 1) % 250 == 0:
             print(f"    G3 step {step + 1}/{n} act {float(o['loss_action']):.4f} "
                   f"stage_acc {float(o['stage_acc']):.3f}", flush=True)
+        # Spread as a curve, not a verdict. A channel that is climbing at the
+        # end of the budget is undertrained; one that is flat near zero is
+        # collapsed, and only the second is an architecture problem.
+        if (step + 1) % max(n // 4, 1) == 0:
+            vm = evaluate(model, va_loader, stats, device, 6, amp, args.label_mode)
+            print(f"      spread@{step + 1} " + " ".join(
+                f"{c}={vm[f'spread_ratio_{c}']:.3f}" for c in TRIVIAL_SPREAD)
+                + f"  path {vm['path_err_m']:.2f}", flush=True)
     v1 = evaluate(model, va_loader, stats, device, 12, amp, args.label_mode)
 
     res["G3"] = bool(v1["path_err_m"] < v0["path_err_m"]
@@ -355,10 +404,10 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
     print(f"  [G4 stage head] acc {v0['stage_acc']:.3f} -> {v1['stage_acc']:.3f}  "
           f"{'PASS' if res['G4'] else 'FAIL'}", flush=True)
 
-    sp = {c: v1[f"spread_ratio_{c}"] for c in KNN_SPREAD}
-    res["G5"] = all(0.5 * KNN_SPREAD[c] < v < 1.25 for c, v in sp.items())
+    sp = {c: v1[f"spread_ratio_{c}"] for c in TRIVIAL_SPREAD}
+    res["G5"] = all(0.5 * TRIVIAL_SPREAD[c] < v < 1.25 for c, v in sp.items())
     print("  [G5 spread / GT spread] " + "  ".join(
-        f"{c}={v:.3f}(>{0.5 * KNN_SPREAD[c]:.2f})" for c, v in sp.items())
+        f"{c}={v:.3f}(>{0.5 * TRIVIAL_SPREAD[c]:.2f})" for c, v in sp.items())
         + f"  {'PASS' if res['G5'] else 'FAIL'}", flush=True)
 
     ok = all(res.values())

@@ -157,9 +157,21 @@ def main():
                           for i in v]) for k, v in idx.items()}
 
     res = collections.defaultdict(lambda: collections.defaultdict(list))
+    # Per-channel spread of the cumulative chunk, as a fraction of the ground
+    # truth's own. This is the reference the G5 collapse gate needs: a healthy
+    # conditional predictor always has *less* spread than the data (it drops
+    # the part the observation does not determine), so an arbitrary floor
+    # cannot tell "collapsed" from "correctly unsure". Running sums instead of
+    # keeping every array -- this is 30k rows x 20 x 4.
+    spread = collections.defaultdict(lambda: np.zeros((2, 3, 4)))  # n,sum,sumsq
 
     def add(name, fam, pred, gt):
         res[name][fam].append(err(pred, gt))
+        for i, x in enumerate((np.cumsum(pred, axis=-2), np.cumsum(gt, axis=-2))):
+            s = spread[name]
+            s[i, 0] += x.shape[-2]
+            s[i, 1] += x.sum(axis=-2)
+            s[i, 2] += (x ** 2).sum(axis=-2)
 
     for r in va:
         _, ins, fam, s0, sf, prog, gt = r
@@ -199,6 +211,23 @@ def main():
             print(f"{k:16s}{allv:9.4f}" +
                   "".join(f"{per.get(f, float('nan')):>{w}.4f}" for f in fams))
 
+    print("\nspread ratio -- std(pred) / std(GT) per channel on the cumulative "
+          "chunk\n")
+    print(f"{'predictor':16s}" + "".join(f"{c:>10s}"
+                                         for c in ("dx", "dy", "dz", "dyaw")))
+    ratios = {}
+    for k in order:
+        s = spread[k]
+        sd = [np.sqrt(np.maximum(s[i, 2] / s[i, 0] - (s[i, 1] / s[i, 0]) ** 2, 0))
+              for i in (0, 1)]
+        r = sd[0] / np.maximum(sd[1], 1e-9)
+        ratios[k] = {c: float(r[j]) for j, c in enumerate(("dx", "dy", "dz", "dyaw"))}
+        print(f"{k:16s}" + "".join(f"{v:>10.3f}" for v in r))
+    print("\nRead the pose-knn row as the per-channel G5 threshold: it is what "
+          "a memoryless predictor with a same-instruction fit pool retains. A "
+          "channel far below it is collapsed; a channel near it is as sure as "
+          "the observation allows.")
+
     print("\nA policy must beat class-progress by a margin worth reporting. "
           "pose-knn is the memoryless ceiling: beating it is evidence the "
           "policy uses something beyond the current pose.\n"
@@ -206,7 +235,7 @@ def main():
           "decomposition is mostly high-frequency and step_err_m is the wrong "
           "headline metric -- fitting it means fitting jitter.")
     if args.out:
-        json.dump({"table": table, "config": vars(args)},
+        json.dump({"table": table, "spread_ratio": ratios, "config": vars(args)},
                   open(args.out, "w"), indent=1)
         print(f"\nwrote {args.out}")
     print("TRIVIAL_BASELINES_DONE", flush=True)

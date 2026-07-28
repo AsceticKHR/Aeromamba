@@ -488,12 +488,13 @@ def run_full(args, model, tr_loader, va_loader, stats, device, amp):
             # the data does not determine, and the official metric scores the
             # path. Selecting on the wrong one is how the v2 line ended up
             # picking its most vision-blind checkpoints.
+            ck = {"model": {k: p for k, p in model.state_dict().items()
+                            if p.dtype.is_floating_point},
+                  "cfg": vars(args), "val": v, "step": step}
+            torch.save(ck, save / "last.pth")
             if v["path_err_m"] < best:
                 best = v["path_err_m"]
-                torch.save({"model": {k: p for k, p in model.state_dict().items()
-                                      if p.dtype.is_floating_point},
-                            "cfg": vars(args), "val": v, "step": step},
-                           save / "best.pth")
+                torch.save(ck, save / "best.pth")
     print("V3_FULL_DONE", flush=True)
 
 

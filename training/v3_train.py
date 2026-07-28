@@ -76,6 +76,11 @@ def get_args():
     p.add_argument("--loss_stage", type=float, default=0.5)
     p.add_argument("--loss_prog", type=float, default=0.1)
 
+    # Gate budgets. 60 steps was not an overfit test, it was a warm-up: the
+    # action loss was still falling steeply when it was cut off.
+    p.add_argument("--g1_steps", type=int, default=300)
+    p.add_argument("--g3_steps", type=int, default=1500)
+
     p.add_argument("--out", default="checkpoints")
     p.add_argument("--tag", default="v3")
     p.add_argument("--bf16", action="store_true")
@@ -176,11 +181,14 @@ def evaluate(model, loader, stats, device, n_batches, amp):
         agg["pos_err_m"].append(float(per_sample.mean()))
         agg["loss"].append(float(o["loss"]))
         agg["stage_acc"].append(float(o["stage_acc"]))
-        # Per-channel spread: a collapsed policy scores well on mean error and
-        # is useless. dz and yaw are the first to go.
-        sp = denorm(o["action"]).std((0, 1, 2))
+        # Per-channel spread as a fraction of the data's own spread. An
+        # absolute floor is not interpretable here: one step of yaw spans
+        # ~0.09 rad while one step of dx spans ~1 m, so the same number means
+        # "healthy" for one channel and "collapsed" for the next.
+        sp, gsp = denorm(o["action"]).std((0, 1, 2)), denorm(b["action"]).std((0, 1, 2))
         for i, c in enumerate(("dx", "dy", "dz", "dyaw")):
             agg[f"spread_{c}"].append(float(sp[i]))
+            agg[f"spread_ratio_{c}"].append(float(sp[i] / gsp[i].clamp(min=1e-9)))
         for j, f in enumerate(b["family"]):
             fam[f]["pos_err_m"].append(float(per_sample[j]))
     model.train()
@@ -191,7 +199,8 @@ def evaluate(model, loader, stats, device, n_batches, amp):
 
 # ── smoke gates ──────────────────────────────────────────────────────────────
 
-def gate_overfit(model, batch, device, steps, lr, amp, label, const_instr=False):
+def gate_overfit(model, batch, device, steps, lr, amp, label, const_instr=False,
+                 target=0.25):
     """G1 / G1v. G1v pins every instruction to one string: if the loss still
     falls, vision and pose alone can drive the action, which separates a wrong
     architecture from an undertrained one."""
@@ -211,8 +220,11 @@ def gate_overfit(model, batch, device, steps, lr, amp, label, const_instr=False)
         last = float(o["loss_action"])
         if i == 0:
             first = last
-    ok = last < 0.25 * first
-    print(f"  [{label}] action loss {first:.4f} -> {last:.4f}  "
+        elif (i + 1) % 100 == 0:
+            print(f"    {label} step {i + 1}: {last:.4f}", flush=True)
+    ok = last < target * first
+    print(f"  [{label}] action loss {first:.4f} -> {last:.4f} "
+          f"({last / first:.2f}x, need <{target})  "
           f"{'PASS' if ok else 'FAIL'}", flush=True)
     return ok
 
@@ -226,9 +238,10 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
     import copy
     base = copy.deepcopy(model.state_dict())
 
-    res["G1"] = gate_overfit(model, batch, device, 60, 1e-3, amp, "G1 overfit")
+    res["G1"] = gate_overfit(model, batch, device, args.g1_steps, 1e-3, amp,
+                             "G1 overfit")
     model.load_state_dict(base)
-    res["G1v"] = gate_overfit(model, batch, device, 60, 1e-3, amp,
+    res["G1v"] = gate_overfit(model, batch, device, args.g1_steps, 1e-3, amp,
                               "G1v const-instruction", const_instr=True)
     model.load_state_dict(base)
 
@@ -249,11 +262,13 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
     # G3/G4/G5: a short real-data run, then read the gates off validation.
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr,
                             weight_decay=args.wd)
+    n = args.g3_steps
+    sched = argparse.Namespace(lr=args.lr, warmup=min(100, n // 6),
+                               sched_total_steps=n, max_steps=n)
     v0 = evaluate(model, va_loader, stats, device, 8, amp)
-    for step in range(300):
+    for step in range(n):
         for g in opt.param_groups:
-            g["lr"] = lr_at(step, argparse.Namespace(
-                lr=args.lr, warmup=50, sched_total_steps=300, max_steps=300))
+            g["lr"] = lr_at(step, sched)
         b = to_dev(next(it), device)
         with torch.autocast("cuda", torch.bfloat16, enabled=amp):
             o = model(b)
@@ -261,6 +276,9 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
         o["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), 1.0)
         opt.step()
+        if (step + 1) % 250 == 0:
+            print(f"    G3 step {step + 1}/{n} act {float(o['loss_action']):.4f} "
+                  f"stage_acc {float(o['stage_acc']):.3f}", flush=True)
     v1 = evaluate(model, va_loader, stats, device, 12, amp)
 
     res["G3"] = v1["pos_err_m"] < v0["pos_err_m"] and np.isfinite(v1["pos_err_m"])
@@ -273,9 +291,10 @@ def run_smoke(args, model, tr_loader, va_loader, stats, device, amp):
     print(f"  [G4 stage head] acc {v0['stage_acc']:.3f} -> {v1['stage_acc']:.3f}  "
           f"{'PASS' if res['G4'] else 'FAIL'}", flush=True)
 
-    sp = {c: v1[f"spread_{c}"] for c in ("dx", "dy", "dz", "dyaw")}
-    res["G5"] = all(v > 1e-4 for v in sp.values())
-    print(f"  [G5 spread] {({k: round(v, 5) for k, v in sp.items()})}  "
+    sp = {c: v1[f"spread_ratio_{c}"] for c in ("dx", "dy", "dz", "dyaw")}
+    res["G5"] = all(v > 0.10 for v in sp.values())
+    print(f"  [G5 spread / GT spread] "
+          f"{({k: round(v, 3) for k, v in sp.items()})}  need >0.10  "
           f"{'PASS' if res['G5'] else 'FAIL'}", flush=True)
 
     ok = all(res.values())

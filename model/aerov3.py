@@ -57,7 +57,14 @@ class AeroV3Config:
     horizon: int = 20
     action_dim: int = 4
     num_stages: int = MAX_STAGES
-    use_phase: bool = True      # ablation A sets this False
+    # The L2 ablation. "filter" is the model: the action reads the estimated
+    # phase. "none" removes the phase from the action path entirely, giving the
+    # memoryless lower bound. "oracle" feeds the ground-truth stage instead of
+    # the estimate, giving the upper bound the mechanism could ever reach.
+    # Reporting filter alone proves nothing -- the gap none -> filter is the
+    # contribution and the gap filter -> oracle is how much of it is left on
+    # the table by estimation error.
+    phase_mode: str = "filter"
     train_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
@@ -65,6 +72,10 @@ class AeroV3Config:
                            "gate_proj", "up_proj", "down_proj")
     loss: dict = field(default_factory=lambda: {
         "action": 1.0, "stage": 0.5, "progress": 0.1})
+
+    @property
+    def use_phase(self) -> bool:
+        return self.phase_mode != "none"
 
 
 # ── pose features ────────────────────────────────────────────────────────────
@@ -211,6 +222,9 @@ class AeroV3(nn.Module):
 
         d_cond = cfg.d_task + POSE_FEAT_DIM + (cfg.d_phase if cfg.use_phase else 0)
         self.readout = ActionReadout(cfg, d_cond)
+        # Last row is the ignore label, for frames outside any annotated
+        # segment. The oracle arm must not be handed a silent zero there.
+        self.stage_embed = nn.Embedding(cfg.num_stages + 1, cfg.d_phase)
 
         # Stage and progress read from phi alone. Routing z_ep in here would let
         # the heads score well without the recurrence carrying anything, and G4
@@ -260,7 +274,8 @@ class AeroV3(nn.Module):
     # ── timescale 2: once per inference step ─────────────────────────────────
 
     def step(self, z_ep: torch.Tensor, pose: torch.Tensor, pose0: torch.Tensor,
-             vis_tokens: torch.Tensor, phi_prev: torch.Tensor | None):
+             vis_tokens: torch.Tensor, phi_prev: torch.Tensor | None,
+             stage: torch.Tensor | None = None):
         """One inference step. ``vis_tokens`` may be a cached encoding from an
         earlier step -- that is the whole point of the vision-rate knob."""
         cfg = self.cfg
@@ -280,7 +295,15 @@ class AeroV3(nn.Module):
         x = self.phase_in(torch.cat([z_ep, pf, kv_vis.mean(1)], dim=-1))
         phi = self.phase_cell(x, phi_prev)
 
-        cond = torch.cat([z_ep, pf, phi], dim=-1) if cfg.use_phase \
+        if cfg.phase_mode == "oracle":
+            if stage is None:
+                raise ValueError("phase_mode='oracle' needs the stage labels")
+            idx = torch.where(stage < 0, cfg.num_stages,
+                              stage.clamp(max=cfg.num_stages - 1))
+            ph = self.stage_embed(idx.long())
+        else:
+            ph = phi
+        cond = torch.cat([z_ep, pf, ph], dim=-1) if cfg.use_phase \
             else torch.cat([z_ep, pf], dim=-1)
         action = self.readout(cond, kv)
         return {
@@ -310,7 +333,8 @@ class AeroV3(nn.Module):
             fresh = upd[:, k].view(B, *([1] * (vis.dim() - 2)))
             held = vis[:, k] if held is None else \
                 fresh * vis[:, k] + (1.0 - fresh) * held
-            r = self.step(z_ep, batch["pose"][:, k], batch["pose0"], held, phi)
+            r = self.step(z_ep, batch["pose"][:, k], batch["pose0"], held, phi,
+                          stage=batch["stage"][:, k])
             phi = r["phase"]
             out.append(r)
 

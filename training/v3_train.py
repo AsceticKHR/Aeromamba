@@ -11,9 +11,15 @@
 
 Ablation switches, matching the L2 table in the validation guide:
 
-    A  --no_phase                     stateless, parameter-matched control
+    A  --phase_mode none              stateless, parameter-matched control
     B  --loss_stage 0 --loss_prog 0   recurrent but action-loss only (RoboMME)
     C  (defaults)                     recurrent + stage supervision
+    D  --phase_mode oracle            ground-truth stage instead of the estimate
+
+A -> C is the contribution. C -> D is how much of it the estimator gives away,
+and it bounds what any better filter could buy. Without A the C number means
+nothing; without D a small A -> C gap cannot be told apart from "the phase is
+useless here".
 """
 from __future__ import annotations
 
@@ -54,7 +60,8 @@ def get_args():
     p.add_argument("--backbone", default="Qwen/Qwen3-0.6B")
     p.add_argument("--vision_type", default="cradio_v3_b")
     p.add_argument("--img_size", type=int, default=256)
-    p.add_argument("--no_phase", action="store_true")
+    p.add_argument("--phase_mode", choices=["filter", "none", "oracle"],
+                   default="filter")
     p.add_argument("--train_lora", action="store_true")
 
     p.add_argument("--window", type=int, default=4)
@@ -99,7 +106,7 @@ def build(args, device):
     cfg = AeroV3Config(
         backbone_id=args.backbone, vision_type=args.vision_type,
         img_size=args.img_size, horizon=args.horizon,
-        use_phase=not args.no_phase, train_lora=args.train_lora,
+        phase_mode=args.phase_mode, train_lora=args.train_lora,
         loss={"action": args.loss_action, "stage": args.loss_stage,
               "progress": args.loss_prog})
     model = AeroV3(cfg).to(device)

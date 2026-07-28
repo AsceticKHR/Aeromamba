@@ -163,6 +163,37 @@ def main() -> int:
           float(o["loss_stage"]) == 0.0, f"{float(o['loss_stage']):.3e}")
     check("stage head gets no gradient", gnorm(model.stage_head) == 0.0)
 
+    # ── the three ablation arms actually differ ──────────────────────────────
+    # The L2 result is a comparison between these three, so a silent leak --
+    # "none" still routing the phase, or "oracle" quietly ignoring the label --
+    # would not fail any other check and would invalidate the whole table.
+    print("\nablation arms")
+    for mode, phase_matters, stage_matters in (("none", False, False),
+                                               ("filter", True, False),
+                                               ("oracle", False, True)):
+        torch.manual_seed(0)
+        m = AeroV3(AeroV3Config(train_lora=False, phase_mode=mode)).eval()
+        b = make_batch(m, m.cfg)
+        with torch.no_grad():
+            z = m.encode_task(b["first_pixel_values"], b["input_ids"],
+                              b["attention_mask"], b["pose0"])
+            vis = m.encode_vision(b["pixel_values"][:, 0])
+            args = (z, b["pose"][:, 0], b["pose0"], vis)
+            phi = torch.randn(B, m.cfg.d_phase)
+            a0 = m.step(*args, torch.zeros(B, m.cfg.d_phase),
+                        stage=b["stage"][:, 0])["action"]
+            a_phi = m.step(*args, phi, stage=b["stage"][:, 0])["action"]
+            a_st = m.step(*args, torch.zeros(B, m.cfg.d_phase),
+                          stage=(b["stage"][:, 0] + 1))["action"]
+        d_phi = float((a_phi - a0).abs().max())
+        d_st = float((a_st - a0).abs().max())
+        check(f"{mode}: action {'reads' if phase_matters else 'ignores'} "
+              f"the estimated phase", (d_phi > 1e-6) == phase_matters,
+              f"delta={d_phi:.2e}")
+        check(f"{mode}: action {'reads' if stage_matters else 'ignores'} "
+              f"the stage label", (d_st > 1e-6) == stage_matters,
+              f"delta={d_st:.2e}")
+
     # ── numerics ─────────────────────────────────────────────────────────────
     print("\nnumerics")
     model.zero_grad(set_to_none=True)

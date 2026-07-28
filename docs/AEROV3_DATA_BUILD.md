@@ -123,8 +123,10 @@ trajectory_generation/stage_annotations/
 
 ### 指令泄漏(设计如此,不是缺陷)
 
-- `test_seen` 与 train 的指令重叠 **95.7%** —— 考的是新初始条件下的泛化
-- `test_unseen` 重叠 **5.8%** —— 考的是新指令 + 新环境
+- `test_seen` 与 train 的指令重叠 **96.7%** —— 考的是新初始条件下的泛化
+- `test_unseen` 重叠 **9.6%** —— 考的是新指令 + 新环境
+
+> 这两个数是按完整标注集、指令原文精确匹配复算的(`scripts/hugebench_data_qc.py`)。早先记的 95.7% / 5.8% 略低,差别在 `test_unseen` 上更明显 —— 它并非完全不重叠,约一成指令在 train 里出现过,写作时不能说成"零重叠"。
 
 报告结果时两个 split 必须分开,合并平均会掩盖泛化差距。
 

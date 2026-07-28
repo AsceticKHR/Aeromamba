@@ -1,0 +1,145 @@
+{
+  "ckpt": "/mnt/c/Users/user/学习/UAV source code/Aeromamba/checkpoints/stage2_v2/best_slim.pth",
+  "probe_json": "/mnt/c/Users/user/学习/UAV source code/Aeromamba/data/open3d_vqa_probe/test_official_probe.json",
+  "contaminated": true,
+  "contamination_note": "Stage2 v2 trained on all Open3D-VQA; this is an in-distribution probe, not a clean official hold-out score.",
+  "n_eval": 10280,
+  "by_bucket": {
+    "direction": {
+      "n": 2251,
+      "exact_acc": 0.48600621945801864,
+      "partial_acc": 0.5699689027099067
+    },
+    "ALL": {
+      "n": 10280,
+      "exact_acc": 0.3369649805447471,
+      "partial_acc": 0.38180933852140075
+    },
+    "other_qual": {
+      "n": 3904,
+      "exact_acc": 0.336577868852459,
+      "partial_acc": 0.3583504098360656
+    },
+    "tf_qual": {
+      "n": 2343,
+      "exact_acc": 0.3879641485275288,
+      "partial_acc": 0.3879641485275288
+    },
+    "distance_quant": {
+      "n": 1782,
+      "exact_acc": 0.08249158249158249,
+      "partial_acc": 0.18742985409652077
+    }
+  },
+  "by_domain": {
+    "real": {
+      "n": 3266,
+      "exact_acc": 0.35119412124923455,
+      "partial_acc": 0.39650949173300676
+    },
+    "sim": {
+      "n": 7014,
+      "exact_acc": 0.33033932135728544,
+      "partial_acc": 0.37496435700028513
+    }
+  },
+  "examples": [
+    {
+      "id": "305214672672.jpg_left_predicate",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "direction",
+      "gt": "Indeed, the white building with vertical windows is positioned on the left side of the curved white railing structure.",
+      "pred": "Incorrect, the white building with vertical windows is not on the left side of the curved white railing structure.",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_right_predicate",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "direction",
+      "gt": "In fact, the white building with vertical windows is either to the left of or directly aligned with the curved white rai",
+      "pred": "In fact, the white building with vertical windows is either to the left of or directly aligned with the curved white rai",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_above_predicate",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "other_qual",
+      "gt": "Correct, the white building with vertical windows is located above the curved white railing structure.",
+      "pred": "Correct, the white building with vertical windows is located above the curved white railing structure.",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_below_predicate",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "other_qual",
+      "gt": "Actually, the white building with vertical windows is either above or at the same elevation as the curved white railing ",
+      "pred": "Actually, the white building with vertical windows is either above or at the same elevation as the curved white railing ",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_front_predicate",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "tf_qual",
+      "gt": "No, the curved white railing structure is behind the white building with vertical windows.",
+      "pred": "No, it is not.",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_behind_predicate",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "tf_qual",
+      "gt": "Yes, the white building with vertical windows is behind the curved white railing structure.",
+      "pred": "No, the curved white railing structure is in front of the white building with vertical windows.",
+      "ok": false
+    },
+    {
+      "id": "305214672672.jpg_left_choice",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "direction",
+      "gt": "Positioned to the left is white building with vertical windows.",
+      "pred": "Positioned to the left is white building with vertical windows.",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_right_choice",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "direction",
+      "gt": "curved white railing structure is more to the right.",
+      "pred": "curved white railing structure is more to the right.",
+      "ok": true
+    },
+    {
+      "id": "305214672672.jpg_above_choice",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "other_qual",
+      "gt": "Positioned higher is white building with vertical windows.",
+      "pred": "curved white railing structure is higher up.",
+      "ok": false
+    },
+    {
+      "id": "305214672672.jpg_below_choice",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "other_qual",
+      "gt": "curved white railing structure is below.",
+      "pred": "curved white railing structure is lower down.",
+      "ok": false
+    },
+    {
+      "id": "305214672672.jpg_front_choice",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "other_qual",
+      "gt": "From the viewer's perspective, curved white railing structure appears closer.",
+      "pred": "curved white railing structure is more closer to the viewer.",
+      "ok": false
+    },
+    {
+      "id": "305214672672.jpg_behind_choice",
+      "scene": "RealworldUAV/Lab",
+      "bucket": "other_qual",
+      "gt": "From the viewer's perspective, white building with vertical windows appears further.",
+      "pred": "curved white railing structure is further to the viewer.",
+      "ok": false
+    }
+  ],
+  "elapsed_s": 15801.640384435654
+}

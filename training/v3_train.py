@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -125,10 +126,13 @@ def loaders(args, model):
     va_ds = HugeBenchWindows(va, windows_per_episode=2, infinite=True,
                              vision_rates=(1,), **kw)
 
+    # partial over the tokenizer, not a closure over the model: a lambda here
+    # would ship the whole 0.7B policy to every dataloader worker.
+    fn = partial(collate, tokenizer=model.tokenizer)
+
     def mk(ds, workers):
         return DataLoader(ds, batch_size=args.batch, num_workers=workers,
-                          collate_fn=lambda b: collate(b, model.tokenizer),
-                          pin_memory=True,
+                          collate_fn=fn, pin_memory=True,
                           persistent_workers=workers > 0)
 
     return mk(tr_ds, args.workers), mk(va_ds, min(2, args.workers)), stats, tr, va

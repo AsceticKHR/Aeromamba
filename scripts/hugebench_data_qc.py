@@ -59,10 +59,11 @@ def main():
     pick = rng.sample(eps, min(args.sample, len(eps)))
 
     # ── 1. actions are exact world-frame pose deltas, in metres ──────────────
-    # Tolerance is per-step, not absolute: both state and actions are stored as
-    # float32, so reconstructing a 2,340-step episode accumulates rounding. A
-    # millimetre after two thousand steps is float32; a unit error would be off
-    # by 100x and show up immediately.
+    # Accumulate in float64. The stored values are exact -- a float32 cumsum
+    # over a 2,340-step episode drifts about a millimetre, which is the
+    # accumulator rounding and not the data. Tolerance is per-step so episode
+    # length cannot turn that drift into a failure; a unit error would still be
+    # 100x out.
     worst_abs = worst_rate = 0.0
     for e in pick:
         st, ac, _, _ = read_episode(e.path, with_images=False)

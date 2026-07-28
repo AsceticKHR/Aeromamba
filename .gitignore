@@ -89,3 +89,10 @@ reports/*.csv
 CLAUDE.md
 scripts/test_stage3_verify.py
 resume.docx
+
+# local scratch: remote helper scripts
+.rq.sh
+.hb_fetch.py
+.kill.sh
+.remote_*
+reports/_archive/

@@ -58,15 +58,30 @@ def load(eps, stride, horizon, max_frames_per_ep):
             step = len(starts) / max_frames_per_ep
             starts = [starts[int(i * step)] for i in range(max_frames_per_ep)]
         for f in starts:
-            rows.append((e.index, e.instruction, e.family, st[0], st[f],
-                         f / max(T - 1, 1), ac[f:f + horizon]))
+            rows.append((e.index, (e.env_id, e.instruction), e.family, st[0],
+                         st[f], f / max(T - 1, 1), ac[f:f + horizon]))
     return rows
 
 
-def err(pred: np.ndarray, gt: np.ndarray) -> float:
-    """Mean over steps of the L2 position error, metres. Same definition the
-    training script evaluates, so the two tables can sit side by side."""
-    return float(np.linalg.norm(pred[..., :3] - gt[..., :3], axis=-1).mean())
+def err(pred: np.ndarray, gt: np.ndarray) -> dict:
+    """Three errors, because they disagree and the disagreement is the point.
+
+    step      mean per-step L2 on the raw deltas. This is what an L1 chunk loss
+              optimises.
+    path      mean L2 between the two cumulative paths. Closest offline proxy
+              for the official soft-DTW path metric.
+    endpoint  L2 between the two 20-step displacements. This is the quantity
+              the partial-observability audit measured, where a pose-kNN lands
+              within 0.24-0.78 m of an 11.33 m signal.
+
+    A predictor can be excellent on endpoint and useless on step if the
+    per-step decomposition is high-frequency. Reporting only one hides that.
+    """
+    d = pred[..., :3] - gt[..., :3]
+    cum = np.cumsum(pred[..., :3], axis=-2) - np.cumsum(gt[..., :3], axis=-2)
+    return {"step": float(np.linalg.norm(d, axis=-1).mean()),
+            "path": float(np.linalg.norm(cum, axis=-1).mean()),
+            "endpoint": float(np.linalg.norm(cum[..., -1, :], axis=-1).mean())}
 
 
 def main():
@@ -74,7 +89,9 @@ def main():
     ap.add_argument("--data_root", required=True)
     ap.add_argument("--anno_root", required=True)
     ap.add_argument("--split", default="train")
-    ap.add_argument("--episodes", type=int, default=600)
+    ap.add_argument("--episodes", type=int, default=1200)
+    ap.add_argument("--min_group", type=int, default=12,
+                    help="min episodes per (env_id, instruction) group")
     ap.add_argument("--frames_per_episode", type=int, default=24)
     ap.add_argument("--stride", type=int, default=EXEC_STEPS)
     ap.add_argument("--horizon", type=int, default=ACTION_HORIZON)
@@ -83,16 +100,36 @@ def main():
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    eps = build_index(args.data_root, args.anno_root, args.split)
+    # Sample whole (env_id, instruction) groups, not random episodes. There are
+    # 1,102 distinct instructions across 5,175 episodes, so a random draw of a
+    # few hundred leaves most instructions with no fit episodes at all and the
+    # class-mean and k-NN predictors silently degrade to the global mean. That
+    # measures the absence of data, not the absence of information -- and it is
+    # exactly how a trivial baseline gets understated.
+    allep = build_index(args.data_root, args.anno_root, args.split)
+    groups = collections.defaultdict(list)
+    for e in allep:
+        groups[(e.env_id, e.instruction)].append(e)
+    dense = [v for v in groups.values() if len(v) >= args.min_group]
+    dense.sort(key=len, reverse=True)
     rng = random.Random(0)
-    rng.shuffle(eps)
-    eps = eps[:args.episodes]
-    n_val = max(1, int(len(eps) * args.val_frac))
-    # Held out by episode. A frame-level split lets a k-NN retrieve the
-    # neighbouring frame of the same trajectory and score near zero.
-    va_eps, tr_eps = eps[:n_val], eps[n_val:]
-    print(f"[baselines] {len(tr_eps)} fit / {len(va_eps)} eval episodes",
-          flush=True)
+    rng.shuffle(dense)
+
+    tr_eps, va_eps = [], []
+    for g in dense:
+        if len(tr_eps) + len(va_eps) >= args.episodes:
+            break
+        rng.shuffle(g)
+        # Split inside the group. Holding out whole groups would leave the
+        # eval instructions with no fit data and reproduce the same artefact.
+        k = max(1, int(len(g) * args.val_frac))
+        va_eps += g[:k]
+        tr_eps += g[k:]
+    print(f"[baselines] {len(dense)} dense groups (>= {args.min_group} eps) of "
+          f"{len(groups)} total; using {len(tr_eps)} fit / {len(va_eps)} eval "
+          f"episodes", flush=True)
+    if not tr_eps:
+        raise SystemExit("no dense groups -- lower --min_group")
 
     tr = load(tr_eps, args.stride, args.horizon, args.frames_per_episode)
     va = load(va_eps, args.stride, args.horizon, args.frames_per_episode)
@@ -120,40 +157,54 @@ def main():
                           for i in v]) for k, v in idx.items()}
 
     res = collections.defaultdict(lambda: collections.defaultdict(list))
+
+    def add(name, fam, pred, gt):
+        res[name][fam].append(err(pred, gt))
+
     for r in va:
         _, ins, fam, s0, sf, prog, gt = r
-        z = np.zeros_like(gt)
-        res["zeros"][fam].append(err(z, gt))
-        res["global-mean"][fam].append(err(gmean, gt))
-        res["class-mean"][fam].append(err(cmean.get(ins, gmean), gt))
-        res["class-progress"][fam].append(
-            err(bmean.get((ins, min(9, int(prog * 10))), cmean.get(ins, gmean)), gt))
+        add("zeros", fam, np.zeros_like(gt), gt)
+        add("global-mean", fam, gmean, gt)
+        add("class-mean", fam, cmean.get(ins, gmean), gt)
+        add("class-progress", fam,
+            bmean.get((ins, min(9, int(prog * 10))), cmean.get(ins, gmean)), gt)
         pool = idx.get(ins)
         if pool:
             q = np.concatenate([s0 * POSE_W, sf * POSE_W])
             d = np.linalg.norm(feats[ins] - q, axis=1)
             nn = np.argsort(d)[:args.knn]
-            res["pose-knn"][fam].append(
-                err(np.mean([tr[pool[j]][6] for j in nn], axis=0), gt))
+            add("pose-knn", fam, np.mean([tr[pool[j]][6] for j in nn], axis=0), gt)
         else:
-            res["pose-knn"][fam].append(err(cmean.get(ins, gmean), gt))
+            add("pose-knn", fam, cmean.get(ins, gmean), gt)
+
+    hit = sum(1 for r in va if idx.get(r[1]))
+    print(f"[baselines] {100 * hit / len(va):.1f}% of eval rows have a "
+          f"non-empty same-group fit pool", flush=True)
 
     fams = sorted({r[2] for r in va})
     order = ["zeros", "global-mean", "class-mean", "class-progress", "pose-knn"]
-    w = max(len(f) for f in fams) + 2
-    print(f"\npos_err_m, mean L2 over a {args.horizon}-step chunk, metres\n")
-    print(f"{'predictor':16s}{'ALL':>9s}" + "".join(f"{f:>{w}s}" for f in fams))
+    w = max(max(len(f) for f in fams) + 2, 9)
     table = {}
-    for k in order:
-        allv = float(np.mean([v for f in fams for v in res[k][f]]))
-        table[k] = {"ALL": allv,
-                    **{f: float(np.mean(res[k][f])) for f in fams if res[k][f]}}
-        print(f"{k:16s}{allv:9.4f}" +
-              "".join(f"{table[k].get(f, float('nan')):>{w}.4f}" for f in fams))
+    for metric, blurb in (
+            ("step", "mean per-step L2 on raw deltas (what an L1 chunk loss fits)"),
+            ("path", "mean L2 between cumulative paths (proxy for soft-DTW)"),
+            ("endpoint", f"L2 of the {args.horizon}-step displacement")):
+        print(f"\n{metric}_err_m -- {blurb}\n")
+        print(f"{'predictor':16s}{'ALL':>9s}" + "".join(f"{f:>{w}s}" for f in fams))
+        for k in order:
+            per = {f: float(np.mean([d[metric] for d in res[k][f]]))
+                   for f in fams if res[k][f]}
+            allv = float(np.mean([d[metric] for f in fams for d in res[k][f]]))
+            table.setdefault(k, {})[metric] = {"ALL": allv, **per}
+            print(f"{k:16s}{allv:9.4f}" +
+                  "".join(f"{per.get(f, float('nan')):>{w}.4f}" for f in fams))
 
     print("\nA policy must beat class-progress by a margin worth reporting. "
-          "pose-knn is the memoryless ceiling: anything at or below it is "
-          "evidence the policy is using something beyond the current pose.")
+          "pose-knn is the memoryless ceiling: beating it is evidence the "
+          "policy uses something beyond the current pose.\n"
+          "If pose-knn is strong on endpoint and weak on step, the per-step "
+          "decomposition is mostly high-frequency and step_err_m is the wrong "
+          "headline metric -- fitting it means fitting jitter.")
     if args.out:
         json.dump({"table": table, "config": vars(args)},
                   open(args.out, "w"), indent=1)

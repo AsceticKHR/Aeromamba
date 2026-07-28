@@ -49,6 +49,17 @@ def main():
                     help="Force zero mean for y / yaw dims (matches aug_flip training, "
                          "where left-right flipping symmetrises the target distribution).")
     ap.add_argument("--turn_thresh_deg", type=float, default=10.0)
+    ap.add_argument("--chunk_offset", type=int, default=0,
+                    help="Skip the first N waypoints of each window. offset=1 "
+                         "drops the anchor row, which is identically zero for "
+                         "anchor-relative targets (std=0 -> wasted loss mass).")
+    ap.add_argument("--pos_unit", default="auto",
+                    choices=["auto", "m", "cm"],
+                    help="Unit of preprocessed_logs xyz. auto-detects "
+                         "metres (real) vs centimetres (sim).")
+    ap.add_argument("--quantile_samples", type=int, default=400000,
+                    help="Chunks retained (evenly strided) for the q01/q99 "
+                         "estimate consumed by --norm_mode quantile.")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -59,8 +70,10 @@ def main():
         transform=None,
         chunk_size=args.chunk_size,
         pos_scale=args.pos_scale,
+        pos_unit=args.pos_unit,
         aug_flip=False,
         split="train",
+        chunk_offset=args.chunk_offset,
     )
     n_total = len(ds.index)
     print(f"[stats] {len(ds.trajectories)} trajectories | {n_total} chunk samples "
@@ -73,12 +86,16 @@ def main():
     n_turn = 0
     n = 0
     abs_max = np.zeros((K, D), dtype=np.float64)
+    q_stride = max(1, n_total // max(1, args.quantile_samples))
+    q_pool = []
 
-    for traj_idx, step_idx in ds.index:
+    for i, (traj_idx, step_idx) in enumerate(ds.index):
         chunk = ds._extract_chunk(ds.trajectories[traj_idx], step_idx).numpy().astype(np.float64)
         acc_sum += chunk
         acc_sq += chunk ** 2
         abs_max = np.maximum(abs_max, np.abs(chunk))
+        if i % q_stride == 0:
+            q_pool.append(chunk.astype(np.float32))
         # dyaw targets are cumulative from the anchor (matches dataset
         # oversampling criterion: max |cumulative yaw| over the window)
         if np.abs(chunk[:, 3]).max() >= turn_thresh_rad:
@@ -96,6 +113,17 @@ def main():
             mean[:, d] = 0.0
             std[:, d] = np.sqrt(acc_sq[:, d] / n)
 
+    pool = np.stack(q_pool)                       # [S, K, D]
+    q01 = np.percentile(pool, 1.0, axis=0)
+    q99 = np.percentile(pool, 99.0, axis=0)
+    if args.symmetrize_lateral:
+        # aug_flip mirrors y / yaw, so the target distribution is symmetric by
+        # construction; enforce it on the quantiles too or the [-1,1] mapping
+        # inherits a spurious lateral bias from finite-sample noise.
+        for d in (1, 3):
+            span = np.maximum(np.abs(q99[:, d]), np.abs(q01[:, d]))
+            q99[:, d], q01[:, d] = span, -span
+
     out = {
         "chunk_size": K,
         "action_dim": D,
@@ -105,9 +133,14 @@ def main():
         "symmetrize_lateral": bool(args.symmetrize_lateral),
         "turn_thresh_deg": args.turn_thresh_deg,
         "turn_fraction": n_turn / max(n, 1),
+        "chunk_offset": args.chunk_offset,
+        "pos_unit": getattr(ds, "pos_unit", args.pos_unit),
         "mean": mean.tolist(),
         "std": std.tolist(),
         "abs_max": abs_max.tolist(),
+        "q01": q01.tolist(),
+        "q99": q99.tolist(),
+        "quantile_samples": int(pool.shape[0]),
     }
     out_path = Path(args.output) if args.output else (
         Path(args.data_root) / f"action_stats_k{K}.json"

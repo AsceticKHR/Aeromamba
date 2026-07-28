@@ -333,10 +333,102 @@ class HFVisionEncoder(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         out = self._vision_forward(pixel_values)
+        # When any backbone params require grad (S0 CPT), use the final block
+        # so the unfrozen tail actually receives gradients. Frozen S1 keeps the
+        # historical penultimate feature (matches LLaVA/SigLIP practice).
+        if any(p.requires_grad for p in self.backbone.parameters()):
+            return out.last_hidden_state
         hidden_states = getattr(out, "hidden_states", None)
         if hidden_states is not None and len(hidden_states) >= 2:
             return hidden_states[-2]
         return out.last_hidden_state
+
+    def freeze(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def unfreeze(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+
+
+# NVIDIA C-RADIO agglomerative single encoder
+# ─────────────────────────────────────────────────────────────────────────────
+
+# C-RADIO presets → HF repo id. Agglomerative distillation of CLIP + DINOv2 +
+# SAM (+SigLIP2) into ONE ViT: gives semantic + geometric + dense features in a
+# single forward, avoiding the 2x cost of a DinoSigLIP dual tower.
+RADIO_ENCODERS: dict[str, str] = {
+    "cradio_v3_b": "nvidia/C-RADIOv3-B",
+    "cradio_v3_l": "nvidia/C-RADIOv3-L",
+    "cradio_v3_h": "nvidia/C-RADIOv3-H",
+}
+
+
+class RADIOVisionEncoder(nn.Module):
+    """NVIDIA C-RADIO single encoder loaded via HF ``trust_remote_code``.
+
+    Returns per-patch spatial features ``[B, N, C]`` matching the VisionEncoder
+    contract. Inputs are expected in ``[0, 1]`` — RADIO's internal
+    ``input_conditioner`` performs normalisation, so the transform only resizes
+    and converts to a tensor (no mean/std normalise).
+
+    NOTE (host setup): C-RADIO's dynamically-downloaded ``dinov2_arch.py`` has a
+    LayerScale loader incompatible with recent ``transformers`` per-parameter
+    meta-loading. The training host patches the cached module (delegating to
+    ``super()._load_from_state_dict`` after renaming legacy ``gamma``→``grandma``)
+    and sets ``HF_HUB_OFFLINE=1`` so the patch is not overwritten.
+    """
+
+    def __init__(self, encoder_type: str = "cradio_v3_b",
+                 img_size: int = 384, freeze: bool = True):
+        super().__init__()
+        if encoder_type not in RADIO_ENCODERS:
+            raise ValueError(
+                f"Unknown RADIO encoder '{encoder_type}'. "
+                f"Choose from {list(RADIO_ENCODERS)}")
+        import os
+        from transformers import AutoModel
+        from torchvision import transforms as T
+
+        self.encoder_type = encoder_type
+        self.model_id = RADIO_ENCODERS[encoder_type]
+        self.img_size = img_size
+        local = os.environ.get("AEROMAMBA_OFFLINE", "0") == "1"
+        self.backbone = AutoModel.from_pretrained(
+            self.model_id, trust_remote_code=True, local_files_only=local)
+        self.backbone.eval()
+
+        self.transform = T.Compose([
+            T.Resize(img_size, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(img_size),
+            T.ToTensor(),  # → [0, 1]; RADIO input_conditioner normalises
+        ])
+
+        # Infer feature dim / patch count from a one-off dummy forward (robust
+        # across C-RADIO sizes without relying on config field names).
+        with torch.no_grad():
+            feats = self._forward_backbone(torch.zeros(1, 3, img_size, img_size))
+        self.hidden_size = int(feats.shape[-1])
+        self.num_patches = int(feats.shape[1])
+
+        if freeze:
+            self.freeze()
+
+    def _forward_backbone(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        out = self.backbone(pixel_values)
+        if isinstance(out, (tuple, list)):
+            feats = out[1]
+        else:
+            feats = getattr(out, "features", None)
+            if feats is None:
+                feats = getattr(out, "last_hidden_state", None)
+        if feats is None:
+            raise RuntimeError("C-RADIO forward did not return spatial features")
+        return feats
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self._forward_backbone(pixel_values)
 
     def freeze(self):
         for p in self.backbone.parameters():

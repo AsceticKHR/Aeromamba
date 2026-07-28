@@ -37,6 +37,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 export TOKENIZERS_PARALLELISM=false
 export AEROMAMBA_TOKENIZER=EleutherAI/gpt-neox-20b
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd /root/autodl-tmp/Aeromamba
 
@@ -69,10 +70,10 @@ python training/stage3_action.py \
   --lambda_smooth 0.0 --lambda_endpoint 0.25 --lambda_direction 0.5 \
   --lambda_acc 0.25 --lambda_binding 0.3 \
   --channel_weight_z 2.5 --channel_weight_yaw 2.5 --magnitude_sample_weight 1 \
-  --batch 48 --epochs 2 --lr 7.5e-5 \
+  --batch 56 --epochs 2 --lr 8.75e-5 \
   --workers 8 --max_text_len 64 \
   --chunk_size 8 --pos_scale 100.0 \
-  --max_val_steps 200 --log_every 100 --save_every_steps 2000 \
+  --max_val_steps 200 --log_every 100 --save_every_steps 5000 \
   --save_dir "$CKPT_ROOT" \
   > "$CKPT_ROOT/train.log" 2>&1
 RC=$?

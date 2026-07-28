@@ -466,7 +466,13 @@ class AeroMambaVLA(nn.Module):
         Returns:
             vis_patches : [B, N_vis, D_v]
         """
-        with torch.no_grad():
+        # AnoleVLA fine-tunes its SigLIP-2 tower end-to-end on demonstrations;
+        # a frozen tower cannot adapt its features to the control task, which
+        # shows up as a near-zero vision sensitivity in the grounding probes.
+        # Keep no_grad only while the tower is actually frozen, so the memory
+        # saving stays for the stages that do freeze it.
+        trainable = any(p.requires_grad for p in self.vision_encoder.parameters())
+        with torch.set_grad_enabled(trainable and torch.is_grad_enabled()):
             vis_patches = self.vision_encoder(pixel_values)
 
         if self.use_token_pooling:
@@ -866,6 +872,24 @@ class AeroMambaVLA(nn.Module):
             for name, p in self.mamba.named_parameters():
                 if "lora_" in name:
                     p.requires_grad = True
+
+    def configure_policy_e2e(self, freeze_vision: bool = False) -> None:
+        """AnoleVLA regime: train the whole policy on demonstrations at once.
+
+        AnoleVLA reaches 67.9% on Meta-World and 63% on a real HSR with no
+        alignment or VLM-SFT stage at all — pretrained SigLIP-2 and Mamba
+        weights are fine-tuned end-to-end on demonstrations only. Staged
+        training buys nothing here because the model never has to emit text,
+        and freezing the tower is what keeps our vision sensitivity at ~0.
+        Use a small learning rate (AnoleVLA uses 1e-5); the backbone is a
+        pretrained LM and will drift fast otherwise.
+        """
+        for p in self.parameters():
+            p.requires_grad = True
+        if freeze_vision:
+            self.vision_encoder.freeze()
+        else:
+            self.vision_encoder.unfreeze()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Diagnostics

@@ -243,6 +243,11 @@ class UAVFlowDataset(Dataset):
         max_text_len:   Max instruction token length.
         split:          'train' | 'val' | 'test'
         pos_scale:      Divisor for position normalisation (cm → ~meters).
+        pos_unit:       Unit of `preprocessed_logs` xyz: 'm', 'cm', or 'auto'.
+                        Real UAV-Flow is metres; UAV-Flow-Sim is centimetres
+                        (UE). 'auto' samples trajectories and picks by magnitude.
+                        Getting this wrong multiplies action targets by ~100 and
+                        makes every offline metre-metric meaningless.
         aug_flip:       Random horizontal flip augmentation (train only).
         aug_vision:     Appearance augmentation (color jitter / grayscale /
                         blur) to shrink the real-photo → Unreal-render domain
@@ -267,6 +272,7 @@ class UAVFlowDataset(Dataset):
         max_text_len:  int   = 64,
         split:         str   = "train",
         pos_scale:     float = 100.0,
+        pos_unit:      str   = "auto",
         aug_flip:      bool  = True,
         aug_vision:    bool  = False,
         oversample_turn_factor: int = 1,
@@ -274,14 +280,41 @@ class UAVFlowDataset(Dataset):
         oversample_class_factor: int = 1,
         emit_binding_labels: bool = False,
         json_extension:str   = ".json",
+        chunk_offset:  int   = 0,
+        terminal_pad_frac: float = 0.0,
     ):
         super().__init__()
         self.data_root    = Path(data_root)
         self.tokenizer    = tokenizer
         self.transform    = transform
         self.chunk_size   = chunk_size
+        # Waypoints are cumulative offsets from the anchor pose, so step
+        # `start + 0` is identically (0, 0, 0, 0) and its per-(k, dim) std is
+        # exactly zero. With offset 0 an eighth of the K=8 loss mass is spent
+        # on a target that carries no information. offset=1 starts the chunk at
+        # the first *future* waypoint.
+        self.chunk_offset = int(chunk_offset)
+        # Recording stops when the pilot stops, so the drone is still moving at
+        # ~92% of cruise speed in the final steps of 89% of trajectories, and no
+        # window ever carries a "you have arrived, hold position" target. The
+        # eval harness, however, ends an episode only when the policy emits
+        # <3cm/step for 10 steps, so a policy trained on unpadded windows can
+        # never terminate. Clamping the target index past the end repeats the
+        # final pose, which turns those steps into genuine zero-displacement
+        # labels. It also keeps short trajectories usable at large K.
+        self.terminal_pad_frac = float(terminal_pad_frac)
+        self.max_pad_steps = int(chunk_size * self.terminal_pad_frac)
         self.max_text_len = max_text_len
         self.pos_scale    = pos_scale
+        unit = str(pos_unit).lower().strip()
+        if unit not in ("auto", "m", "cm", "meter", "meters", "centimeter", "centimeters"):
+            raise ValueError(
+                f"pos_unit must be 'auto'|'m'|'cm', got {pos_unit!r}")
+        if unit in ("meter", "meters"):
+            unit = "m"
+        elif unit in ("centimeter", "centimeters"):
+            unit = "cm"
+        self.pos_unit_arg = unit
         self.aug_flip     = aug_flip and (split == "train")
         self.split        = split
 
@@ -313,11 +346,29 @@ class UAVFlowDataset(Dataset):
                 "Check data_root path."
             )
 
+        # Resolve preprocessed xyz units BEFORE parsing trajectories. Real
+        # UAV-Flow stores metres; UAV-Flow-Sim stores centimetres. The loader
+        # historically always did pose_cm = preprocessed * 100, which is correct
+        # only for metres and silently 100×-inflates sim action targets.
+        self.pos_unit = (
+            self._detect_preprocessed_pos_unit(self.traj_files)
+            if self.pos_unit_arg == "auto"
+            else self.pos_unit_arg
+        )
+        print(
+            f"[UAVFlowDataset] preprocessed pos_unit={self.pos_unit} "
+            f"(arg={self.pos_unit_arg}, pos_scale={self.pos_scale})",
+            flush=True,
+        )
+
         self.emit_binding_labels = emit_binding_labels
 
         # Build flat index: (traj_file_idx, step_idx) for each valid chunk
         self.index: List[Tuple[int, int]] = []
         self.trajectories: List[List[Dict[str, Any]]] = []
+        # traj_files entries that survived the length filter, aligned index-wise
+        # with self.trajectories (traj_files is not, since short ones are skipped).
+        self.kept_traj_files: List[Path] = []
         # Per-trajectory motion class (regex over the unmirrored instruction;
         # mirroring never changes the class).
         self.traj_motion_class: List[int] = []
@@ -329,9 +380,11 @@ class UAVFlowDataset(Dataset):
 
         for traj_idx, traj_path in enumerate(self.traj_files):
             traj = self._load_trajectory(traj_path)
-            if not isinstance(traj, list) or len(traj) < chunk_size:
+            if (not isinstance(traj, list)
+                    or len(traj) < chunk_size + self.chunk_offset - self.max_pad_steps):
                 continue
             self.trajectories.append(traj)
+            self.kept_traj_files.append(traj_path)
             t = len(self.trajectories) - 1
 
             instruction = (
@@ -359,14 +412,18 @@ class UAVFlowDataset(Dataset):
                     float(step.get("state", [[0, 0, 0], [0, 0, 0]])[1][1])
                     for step in traj
                 ]
-            # Sliding window: every step where a full K-chunk is available
-            for step_idx in range(len(traj) - chunk_size + 1):
+            # Sliding window. A window may run at most max_pad_steps past the
+            # end of the trajectory; those steps hold the final pose.
+            last = len(traj) - 1
+            n_start = len(traj) - chunk_size - self.chunk_offset + 1 + self.max_pad_steps
+            for step_idx in range(max(n_start, 1)):
                 self.index.append((t, step_idx))
                 turn_factor = 1
                 if yaws is not None:
                     yaw0 = yaws[step_idx]
                     max_dyaw = max(
-                        abs((yaws[step_idx + k] - yaw0 + 180.0) % 360.0 - 180.0)
+                        abs((yaws[min(step_idx + self.chunk_offset + k, last)]
+                             - yaw0 + 180.0) % 360.0 - 180.0)
                         for k in range(chunk_size)
                     )
                     if max_dyaw >= oversample_turn_deg:
@@ -515,10 +572,21 @@ class UAVFlowDataset(Dataset):
                     raw_logs[idx] if idx < len(raw_logs) else [],
                     raw_origin=raw_origin,
                 )
-                pos_unit_scale = 1.0
+                # raw_logs are already centimetres in both real and sim dumps.
+                x_cm = float(pose["x_cm"])
+                y_cm = float(pose["y_cm"])
+                z_cm = float(pose["z_cm"])
+            elif self.pos_unit == "cm":
+                # Sim: preprocessed xyz is already cm. Do NOT × pos_scale again.
+                x_cm = float(pose["x_cm"])
+                y_cm = float(pose["y_cm"])
+                z_cm = float(pose["z_cm"])
             else:
-                pos_unit_scale = self.pos_scale
-            state_pose = [pose["x_m"], pose["y_m"], pose["z_m"]]
+                # Real: preprocessed xyz is metres → convert to cm for pose_cm.
+                x_cm = float(pose["x_m"]) * self.pos_scale
+                y_cm = float(pose["y_m"]) * self.pos_scale
+                z_cm = float(pose["z_m"]) * self.pos_scale
+            state_pose = [x_cm / self.pos_scale, y_cm / self.pos_scale, z_cm / self.pos_scale]
             state_att = [pose["roll_deg"], pose["yaw_deg"], pose["pitch_deg"]]
             if traj:
                 prev_state = traj[-1]["state"]
@@ -540,14 +608,81 @@ class UAVFlowDataset(Dataset):
                     "instruction": instruction,
                     "state": [state_pose, state_att, velocity],
                     "pose_cm": [
-                        pose["x_cm"] * pos_unit_scale,
-                        pose["y_cm"] * pos_unit_scale,
-                        pose["z_cm"] * pos_unit_scale,
+                        x_cm,
+                        y_cm,
+                        z_cm,
                         pose["yaw_deg"],
                     ],
                 }
             )
         return traj
+
+    @staticmethod
+    def _detect_preprocessed_pos_unit(
+        traj_files: List[Path],
+        sample_n: int = 64,
+        seed: int = 0,
+    ) -> str:
+        """Classify preprocessed xyz as metres or centimetres by magnitude.
+
+        Empirically (UAV-Flow vs UAV-Flow-Sim):
+          real  median step ≈ 0.13, median span ≈ 7
+          sim   median step ≈ 20,   median span ≈ 500
+        A step median above 2.0 cannot be metres at 5 Hz cruise, so → cm.
+        """
+        import random as _random
+
+        candidates = [p for p in traj_files if p.name == "log.json"]
+        if not candidates:
+            candidates = list(traj_files)
+        if not candidates:
+            return "m"
+        rng = _random.Random(seed)
+        sample = candidates if len(candidates) <= sample_n else rng.sample(
+            candidates, sample_n)
+        step_norms: List[float] = []
+        spans: List[float] = []
+        for path in sample:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            pp = payload.get("preprocessed_logs") or []
+            pts = []
+            for row in pp:
+                if isinstance(row, (list, tuple)) and len(row) >= 3:
+                    try:
+                        pts.append([float(row[0]), float(row[1]), float(row[2])])
+                    except (TypeError, ValueError):
+                        continue
+            if len(pts) < 2:
+                continue
+            import math as _math
+            for i in range(1, len(pts)):
+                dx = pts[i][0] - pts[i - 1][0]
+                dy = pts[i][1] - pts[i - 1][1]
+                dz = pts[i][2] - pts[i - 1][2]
+                step_norms.append(_math.sqrt(dx * dx + dy * dy + dz * dz))
+            dx = pts[-1][0] - pts[0][0]
+            dy = pts[-1][1] - pts[0][1]
+            dz = pts[-1][2] - pts[0][2]
+            spans.append(_math.sqrt(dx * dx + dy * dy + dz * dz))
+        if not step_norms:
+            print("[UAVFlowDataset] unit detect: no usable preprocessed logs; "
+                  "defaulting to metres", flush=True)
+            return "m"
+        step_norms.sort()
+        spans.sort()
+        step_med = step_norms[len(step_norms) // 2]
+        span_med = spans[len(spans) // 2] if spans else 0.0
+        unit = "cm" if (step_med > 2.0 or span_med > 50.0) else "m"
+        print(
+            f"[UAVFlowDataset] unit detect: step_med={step_med:.4f} "
+            f"span_med={span_med:.4f} → {unit} "
+            f"(n_files={len(sample)}, n_steps={len(step_norms)})",
+            flush=True,
+        )
+        return unit
 
     @staticmethod
     def _raw_xyz(raw: Any) -> tuple[float, float, float]:
@@ -654,8 +789,11 @@ class UAVFlowDataset(Dataset):
             return self._extract_body_frame_chunk(traj, start)
 
         chunk = []
+        last = len(traj) - 1
         for k in range(self.chunk_size):
-            step = traj[start + k]
+            # Clamping past the end repeats the terminal pose: the label becomes
+            # "hold here", which is the only stopping signal in this data.
+            step = traj[min(start + self.chunk_offset + k, last)]
             raw_action = step.get(
                 "action",
                 step.get("state", [[0, 0, 0], [0, 0, 0]])[0] + [0]
@@ -679,8 +817,9 @@ class UAVFlowDataset(Dataset):
         sin_yaw = math.sin(yaw0_rad)
 
         chunk = []
+        last = len(traj) - 1
         for k in range(self.chunk_size):
-            step = traj[start + k]
+            step = traj[min(start + self.chunk_offset + k, last)]
             pose = step.get("pose_cm", anchor_pose)
             x, y, z, yaw = [float(value) for value in pose[:4]]
             dx_world = x - x0

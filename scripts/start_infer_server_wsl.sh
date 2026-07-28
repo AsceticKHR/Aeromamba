@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO="${AEROMAMBA_REPO:-/mnt/c/Users/user/学习/UAV source code/Aeromamba}"
 PY="${AEROMAMBA_PY:-/home/khr/miniconda3/envs/aeromamba/bin/python}"
-CKPT="${CKPT:-$REPO/checkpoints/stage3_v2/best_slim.pth}"
+CKPT="${CKPT:-$REPO/checkpoints/stage3_v3/best_slim.pth}"
 PORT="${PORT:-5007}"
 
 EXEC_MODE="${EXEC_MODE:-chunk}"

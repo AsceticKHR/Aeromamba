@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from data.hugebench_dataset import (ACTION_HORIZON, EXEC_STEPS, build_index,
-                                    read_episode)
+                                    read_episode, split_by_episode)
 
 # Yaw is in radians and one step spans ~0.09 rad while position spans ~1 m.
 # Without this the neighbour search is decided entirely by position.
@@ -97,6 +97,9 @@ def main():
     ap.add_argument("--horizon", type=int, default=ACTION_HORIZON)
     ap.add_argument("--knn", type=int, default=8)
     ap.add_argument("--val_frac", type=float, default=0.2)
+    ap.add_argument("--policy_split", action="store_true",
+                    help="split like training/v3_train.py so the numbers can "
+                         "sit in the same table as a policy's")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -110,26 +113,38 @@ def main():
     groups = collections.defaultdict(list)
     for e in allep:
         groups[(e.env_id, e.instruction)].append(e)
-    dense = [v for v in groups.values() if len(v) >= args.min_group]
-    dense.sort(key=len, reverse=True)
-    rng = random.Random(0)
-    rng.shuffle(dense)
 
-    tr_eps, va_eps = [], []
-    for g in dense:
-        if len(tr_eps) + len(va_eps) >= args.episodes:
-            break
-        rng.shuffle(g)
-        # Split inside the group. Holding out whole groups would leave the
-        # eval instructions with no fit data and reproduce the same artefact.
-        k = max(1, int(len(g) * args.val_frac))
-        va_eps += g[:k]
-        tr_eps += g[k:]
-    print(f"[baselines] {len(dense)} dense groups (>= {args.min_group} eps) of "
-          f"{len(groups)} total; using {len(tr_eps)} fit / {len(va_eps)} eval "
-          f"episodes", flush=True)
+    if args.policy_split:
+        # Same split procedure the policy trains under: whole episodes, 3% out,
+        # every remaining episode in the fit pool. The dense-group sampler below
+        # exists to keep the fit pool non-empty on a small draw, but it does so
+        # by restricting to the most repeated instructions, which is an easier
+        # subset than the policy is evaluated on. Numbers from the two modes
+        # must not be put in the same table.
+        tr_eps, va_eps = split_by_episode(allep, args.val_frac, seed=0)
+        print(f"[baselines] policy split: {len(tr_eps)} fit / {len(va_eps)} "
+              f"eval episodes over all {len(groups)} groups", flush=True)
+    else:
+        dense = [v for v in groups.values() if len(v) >= args.min_group]
+        dense.sort(key=len, reverse=True)
+        rng = random.Random(0)
+        rng.shuffle(dense)
+
+        tr_eps, va_eps = [], []
+        for g in dense:
+            if len(tr_eps) + len(va_eps) >= args.episodes:
+                break
+            rng.shuffle(g)
+            # Split inside the group. Holding out whole groups would leave the
+            # eval instructions with no fit data and reproduce the artefact.
+            k = max(1, int(len(g) * args.val_frac))
+            va_eps += g[:k]
+            tr_eps += g[k:]
+        print(f"[baselines] {len(dense)} dense groups (>= {args.min_group} eps) "
+              f"of {len(groups)} total; using {len(tr_eps)} fit / {len(va_eps)} "
+              f"eval episodes", flush=True)
     if not tr_eps:
-        raise SystemExit("no dense groups -- lower --min_group")
+        raise SystemExit("no fit episodes -- lower --min_group")
 
     tr = load(tr_eps, args.stride, args.horizon, args.frames_per_episode)
     va = load(va_eps, args.stride, args.horizon, args.frames_per_episode)

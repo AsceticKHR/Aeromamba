@@ -228,9 +228,14 @@ def evaluate(model, loader, stats, device, n_batches, amp, mode="cumulative"):
 # ── smoke gates ──────────────────────────────────────────────────────────────
 
 # Best per-channel spread any trivial predictor retains on the cumulative
-# chunk, over 5,425 held-out windows (scripts/hugebench_trivial_baselines.py).
-# Channel-wise max of pose-kNN (0.816/0.900/0.453/0.623) and class-progress
-# (0.348/0.649/0.714/0.480). G5 wants at least half of it.
+# chunk (scripts/hugebench_trivial_baselines.py --policy_split), channel-wise
+# max of pose-kNN (0.713/0.641/0.583/0.516) and class-progress
+# (0.538/0.563/0.898/0.724). G5 wants at least half of it.
+#
+# These come from the policy split -- whole episodes, 3% out, every remaining
+# episode in the fit pool -- because that is the split the gate reads its own
+# numbers from. The dense-group sampler gives a different and easier subset
+# (0.816/0.900/0.714/0.623) and mixing the two silently moves the thresholds.
 #
 # The point of keying the gate to a measurement: a well-behaved conditional
 # predictor *always* has less spread than the data, because it drops the part
@@ -250,7 +255,7 @@ def evaluate(model, loader, stats, device, n_batches, amp, mode="cumulative"):
 # Over-dispersion is a failure too -- exceeding the data's own spread means
 # variance is being injected, which is how the v2 line's lambda_var produced a
 # policy that moved a lot and tracked nothing.
-TRIVIAL_SPREAD = {"dx": 0.816, "dy": 0.900, "dz": 0.714, "dyaw": 0.623}
+TRIVIAL_SPREAD = {"dx": 0.713, "dy": 0.641, "dz": 0.898, "dyaw": 0.724}
 
 def _mean_loss(batches) -> float:
     """Masked L1 of the best constant-per-horizon-index predictor on the

@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
-from data.hugebench_dataset import (STAGE_IGNORE, build_index, read_episode,
-                                    task_family)
+from data.hugebench_dataset import (PAPER_ORBIT_IDS, STAGE_IGNORE, build_index,
+                                    read_episode, task_family)
 
 FAILED: list[str] = []
 
@@ -41,26 +41,41 @@ def main():
     ap.add_argument("--sample", type=int, default=40)
     args = ap.parse_args()
 
+    # Distribution checks run on the full annotated split; only the checks that
+    # must open a parquet run on what is downloaded. The release is ordered so
+    # that episode index tracks task_id, so a partial download is a skewed
+    # sample and reading distributions off it produces confident nonsense.
+    allep = build_index(args.data_root, args.anno_root, args.split,
+                        require_stages=False, require_file=False)
     eps = build_index(args.data_root, args.anno_root, args.split,
                       require_stages=False)
-    print(f"\nindexed {len(eps)} episodes on disk for split '{args.split}'\n")
+    cover = len(eps) / max(len(allep), 1)
+    print(f"\nsplit '{args.split}': {len(allep)} annotated, {len(eps)} on disk "
+          f"({100 * cover:.1f}%)\n")
     if not eps:
-        raise SystemExit("nothing indexed")
+        raise SystemExit("nothing on disk")
 
     rng = random.Random(0)
     pick = rng.sample(eps, min(args.sample, len(eps)))
 
     # ── 1. actions are exact world-frame pose deltas, in metres ──────────────
-    worst = 0.0
+    # Tolerance is per-step, not absolute: both state and actions are stored as
+    # float32, so reconstructing a 2,340-step episode accumulates rounding. A
+    # millimetre after two thousand steps is float32; a unit error would be off
+    # by 100x and show up immediately.
+    worst_abs = worst_rate = 0.0
     for e in pick:
         st, ac, _, _ = read_episode(e.path, with_images=False)
         n = min(len(st) - 1, len(ac))
         if n <= 0:
             continue
-        recon = st[0, :3] + np.cumsum(ac[:n, :3], axis=0)
-        worst = max(worst, float(np.abs(recon - st[1:n + 1, :3]).max()))
-    check("state[0] + cumsum(actions) reproduces state[1:]", worst < 1e-3,
-          f"max |err| = {worst:.6f} m")
+        recon = st[0, :3].astype(np.float64) + np.cumsum(
+            ac[:n, :3].astype(np.float64), axis=0)
+        err = float(np.abs(recon - st[1:n + 1, :3]).max())
+        worst_abs = max(worst_abs, err)
+        worst_rate = max(worst_rate, err / n)
+    check("state[0] + cumsum(actions) reproduces state[1:]", worst_rate < 1e-5,
+          f"max |err| = {worst_abs * 1e3:.3f} mm, per step {worst_rate * 1e6:.2f} um")
 
     # ── 2. first_image really is constant within an episode ──────────────────
     import pyarrow.parquet as pq
@@ -74,9 +89,9 @@ def main():
     check("first_image is byte-identical across all rows", const)
 
     # ── 3. stage annotation coverage and label domain ────────────────────────
-    cov = [float((e.stages >= 0).mean()) for e in eps]
+    cov = [float((e.stages >= 0).mean()) for e in allep]
     dom = set()
-    for e in eps:
+    for e in allep:
         dom.update(int(v) for v in np.unique(e.stages) if v >= 0)
     n_unann = sum(1 for c in cov if c == 0.0)
     check("stage coverage > 90% of frames", float(np.mean(cov)) > 0.90,
@@ -86,21 +101,22 @@ def main():
           f"{sorted(dom)}")
 
     # ── 4. family mix; Orbit is where the partial observability lives ────────
-    fam = collections.Counter(e.family for e in eps)
-    frames = collections.Counter()
-    for e in eps:
+    fam, frames = collections.Counter(), collections.Counter()
+    for e in allep:
+        fam[e.family] += 1
         frames[e.family] += e.length
-    tot = sum(frames.values())
-    share = 100 * frames["orbit"] / max(tot, 1)
-    print("  families (episodes / frames):", {
-        k: (fam[k], frames[k]) for k in sorted(fam)})
-    check("orbit family share is 25-45% of frames", 25 <= share <= 45,
-          f"{share:.1f}%")
-    check("no episode falls outside the two named families",
-          fam.get("other", 0) == 0, f"other={fam.get('other', 0)}")
+    tot_e, tot_f = sum(fam.values()), sum(frames.values())
+    for k in sorted(fam):
+        print(f"  {k:9s} eps {fam[k]:5d} ({100 * fam[k] / tot_e:4.1f}%)  "
+              f"frames {frames[k]:7d} ({100 * frames[k] / tot_f:4.1f}%)")
+    paper = sum(1 for e in allep if e.task_id in PAPER_ORBIT_IDS)
+    check("published Orbit share (hl+orbit+orbit_multi) is ~34% of episodes",
+          30 <= 100 * paper / tot_e <= 38, f"{100 * paper / tot_e:.1f}%")
+    check("every episode maps to a known family", fam.get("other", 0) == 0,
+          f"other={fam.get('other', 0)}")
 
     # ── 5. episode length distribution ───────────────────────────────────────
-    L = np.array([e.length for e in eps])
+    L = np.array([e.length for e in allep])
     print(f"  length p50={int(np.median(L))} p90={int(np.percentile(L, 90))} "
           f"max={int(L.max())} min={int(L.min())}")
     check("median episode length near the documented 267",
@@ -120,16 +136,17 @@ def main():
               f"n={len(v)}")
 
     # ── 7. instruction overlap between splits ────────────────────────────────
+    # Annotations again, not disk: the whole point of the number is that
+    # test_seen reuses train instructions, and a partial train set understates
+    # it. The two splits must always be reported separately.
     try:
-        tr = {e.instruction for e in build_index(args.data_root, args.anno_root,
-                                                 "train", require_stages=False)}
+        tr = {e.instruction for e in build_index(
+            args.data_root, args.anno_root, "train", require_stages=False,
+            require_file=False)}
         for s, want in (("test_seen", 0.957), ("test_unseen", 0.058)):
             te = build_index(args.data_root, args.anno_root, s,
-                             require_stages=False)
-            if not te:
-                print(f"  {s}: not on disk, skipped")
-                continue
-            ov = np.mean([e.instruction in tr for e in te])
+                             require_stages=False, require_file=False)
+            ov = float(np.mean([e.instruction in tr for e in te]))
             check(f"{s} instruction overlap near {100 * want:.1f}%",
                   abs(ov - want) < 0.10, f"{100 * ov:.1f}%")
     except FileNotFoundError as e:

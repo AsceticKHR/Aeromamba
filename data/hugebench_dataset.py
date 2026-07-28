@@ -42,22 +42,43 @@ STAGE_IGNORE = -1
 
 
 # ── task families ────────────────────────────────────────────────────────────
-# The Orbit family is where the aliasing and the partial observability live
-# (2.3-4.8% aliased frames against 0.0% everywhere else), so every result is
-# reported split by family. Classification is by instruction text because
-# ``task_id`` groups by generation script, not by motion type.
+# Every result is reported split by family, because the Orbit family is where
+# the aliasing and the partial observability live (2.3-4.8% aliased frames
+# against 0.0% elsewhere) and Inspect behaves in the opposite direction.
+#
+# Grouping is by ``task_id`` from the annotations, not by instruction text. A
+# keyword classifier gets this wrong: ``building`` reads "Orbit the building in
+# the upper left of the view once" and is an orbit motion, but the paper's
+# 34%-of-episodes Orbit group counts only hl / orbit / orbit_multi. The table
+# below is the measured composition of all 5,175 train episodes.
+#
+#   task_id      eps%   frames%  stages  motion
+#   0            33.5    10.0      3     fly to N metres above a named target
+#   building     10.1    17.6      6     orbit a referred building, no radius
+#   hl           13.4    11.1      6     orbit at a named altitude
+#   orbit        13.4    11.9      6     orbit at a named altitude and radius
+#   orbit_multi   7.1    11.3      6     spiral down around a target
+#   road         11.7    17.8      5     follow a road in a given direction
+#   farm          2.2    10.1      4     boustrophedon mapping sweep
+#   obstacle      8.5    10.3     1-2    reach a pose behind/between obstacles
 
-_ORBIT_WORDS = ("orbit", "circle", "circling", "around", "spiral", "loop")
-_INSPECT_WORDS = ("fly to", "above", "inspect", "hover", "look at", "face")
+TASK_FAMILY = {
+    "0": "inspect",
+    "building": "orbit",
+    "hl": "orbit",
+    "orbit": "orbit",
+    "orbit_multi": "orbit",
+    "road": "road",
+    "farm": "survey",
+    "obstacle": "obstacle",
+}
+
+# The three ids the published Orbit share (34% of episodes) is computed over.
+PAPER_ORBIT_IDS = ("hl", "orbit", "orbit_multi")
 
 
-def task_family(instruction: str) -> str:
-    s = instruction.lower()
-    if any(w in s for w in _ORBIT_WORDS):
-        return "orbit"
-    if any(w in s for w in _INSPECT_WORDS):
-        return "inspect"
-    return "other"
+def task_family(task_id: str) -> str:
+    return TASK_FAMILY.get(str(task_id), "other")
 
 
 @dataclass
@@ -84,9 +105,14 @@ def _episode_path(root: Path, split: str, idx: int) -> Path:
 
 def build_index(data_root: str | Path, anno_root: str | Path, split: str,
                 require_stages: bool = True,
-                families: Sequence[str] | None = None) -> list[Episode]:
-    """Index episodes from the sidecar annotations, keeping only those whose
-    parquet is actually on disk.
+                families: Sequence[str] | None = None,
+                require_file: bool = True) -> list[Episode]:
+    """Index episodes from the sidecar annotations.
+
+    ``require_file=False`` indexes the full annotated split regardless of what
+    has been downloaded. Distribution statistics must use that: the release is
+    ordered so episode index correlates with ``task_id``, which makes any
+    prefix of the download a badly skewed sample of families and lengths.
 
     The annotations are the authority for length and instruction. ``info.json``
     is not: it reports ``total_tasks: 109`` against 5,175 episodes and 1,102
@@ -115,13 +141,14 @@ def build_index(data_root: str | Path, anno_root: str | Path, split: str,
             p = _episode_path(data_root, split, idx)
             if not p.exists():
                 missing += 1
-                continue
+                if require_file:
+                    continue
             stages = np.full(T, STAGE_IGNORE, dtype=np.int16)
             for a, b, s in segs.get(idx, []):
                 stages[a:min(b, T - 1) + 1] = s
             if require_stages and not (stages >= 0).any():
                 continue
-            fam = task_family(r["instruction"])
+            fam = task_family(r["task_id"])
             if families and fam not in families:
                 continue
             out.append(Episode(idx, p, r["env_id"], str(r["task_id"]),

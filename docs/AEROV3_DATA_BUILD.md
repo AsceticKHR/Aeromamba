@@ -52,7 +52,10 @@ task_index    int64
 三个必须知道的点:
 
 1. **图像内嵌在 parquet(LeRobot 图像模式,不是视频模式)。** 训练不需要渲染器。
-2. **`first_image` 逐帧重复存储。** 一个 267 帧的 episode 把同一张图存了 267 遍 —— 这是 28 MB/episode 的主要来源。**dataloader 必须按 episode 读一次并缓存**,否则 IO 白白翻倍。这同时是架构上 `z_ep` 可缓存的数据侧佐证。
+2. **`first_image` 逐帧重复存储,但不占磁盘。** 一个 267 帧的 episode 把同一张图存了 267 遍,而 parquet 的字典编码把重复字节压掉了 —— 实测单文件构成:`image.bytes` **98.8%**,`first_image.bytes` 仅 **1.2%**。
+   > 早先"`first_image` 是 28 MB/episode 的主要来源、IO 白白翻倍"的说法**是错的**,实测推翻。真正的体积在当前帧图像上。
+   >
+   > **缓存仍然必要,但理由不同**:省的是逐帧重复 JPEG 解码的 CPU,不是 IO。这一点同时是架构上 `z_ep` 可缓存的数据侧佐证。
 3. **指令不在 parquet 里。** 通过 `task_index` 查 `meta/tasks.jsonl`。`action_infer.py` 依次尝试 `prompt` → `task` → `instruction`,由 LeRobot 的 dataset 对象注入。
 
 ### 只读 state 不读图像
